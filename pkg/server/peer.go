@@ -38,6 +38,7 @@ type peerGroup struct {
 	Conf             *oc.PeerGroup
 	members          map[string]oc.Neighbor
 	dynamicNeighbors map[string]*oc.DynamicNeighbor
+	tcpAoAttachment  *tcpAoAttachment
 }
 
 func newPeerGroup(c *oc.PeerGroup) *peerGroup {
@@ -119,6 +120,7 @@ type peer struct {
 	sendMaxPathFiltered sync.Map
 	llgrEndChs          []chan struct{} // protected by fsm.lock
 	longLivedRunning    atomic.Bool
+	tcpAoAttachment     *tcpAoAttachment
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
 	rtmHandler *table.RouteTargetMembershipHandler
 	// Route refresh in progress, during an established session or route refresh, this need to be atomic to avoid out of order updates

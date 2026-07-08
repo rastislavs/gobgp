@@ -1319,6 +1319,33 @@ func (s *server) UpdatePeerGroup(ctx context.Context, r *api.UpdatePeerGroupRequ
 	return s.bgpServer.UpdatePeerGroup(ctx, r)
 }
 
+func (s *server) AddTcpAoKeychain(ctx context.Context, r *api.AddTcpAoKeychainRequest) (*api.AddTcpAoKeychainResponse, error) {
+	return s.bgpServer.AddTcpAoKeychain(ctx, r)
+}
+
+func (s *server) DeleteTcpAoKeychain(ctx context.Context, r *api.DeleteTcpAoKeychainRequest) (*api.DeleteTcpAoKeychainResponse, error) {
+	if err := s.bgpServer.DeleteTcpAoKeychain(ctx, r); err != nil {
+		return nil, err
+	}
+	return &api.DeleteTcpAoKeychainResponse{}, nil
+}
+
+func (s *server) ListTcpAoKeychain(r *api.ListTcpAoKeychainRequest, stream grpc.ServerStreamingServer[api.ListTcpAoKeychainResponse]) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	var sendErr error
+	fn := func(chain *api.TcpAoKeychain) {
+		if sendErr = stream.Send(&api.ListTcpAoKeychainResponse{Keychain: chain}); sendErr != nil {
+			cancel()
+		}
+	}
+	err := s.bgpServer.ListTcpAoKeychain(ctx, r, fn)
+	if sendErr != nil {
+		return sendErr
+	}
+	return err
+}
+
 func (s *server) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNeighborRequest) (*api.AddDynamicNeighborResponse, error) {
 	return &api.AddDynamicNeighborResponse{}, s.bgpServer.AddDynamicNeighbor(ctx, r)
 }

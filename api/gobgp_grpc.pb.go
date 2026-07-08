@@ -56,6 +56,9 @@ const (
 	GoBgpService_DeletePeerGroup_FullMethodName        = "/api.GoBgpService/DeletePeerGroup"
 	GoBgpService_ListPeerGroup_FullMethodName          = "/api.GoBgpService/ListPeerGroup"
 	GoBgpService_UpdatePeerGroup_FullMethodName        = "/api.GoBgpService/UpdatePeerGroup"
+	GoBgpService_AddTcpAoKeychain_FullMethodName       = "/api.GoBgpService/AddTcpAoKeychain"
+	GoBgpService_DeleteTcpAoKeychain_FullMethodName    = "/api.GoBgpService/DeleteTcpAoKeychain"
+	GoBgpService_ListTcpAoKeychain_FullMethodName      = "/api.GoBgpService/ListTcpAoKeychain"
 	GoBgpService_AddDynamicNeighbor_FullMethodName     = "/api.GoBgpService/AddDynamicNeighbor"
 	GoBgpService_ListDynamicNeighbor_FullMethodName    = "/api.GoBgpService/ListDynamicNeighbor"
 	GoBgpService_DeleteDynamicNeighbor_FullMethodName  = "/api.GoBgpService/DeleteDynamicNeighbor"
@@ -119,6 +122,9 @@ type GoBgpServiceClient interface {
 	DeletePeerGroup(ctx context.Context, in *DeletePeerGroupRequest, opts ...grpc.CallOption) (*DeletePeerGroupResponse, error)
 	ListPeerGroup(ctx context.Context, in *ListPeerGroupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListPeerGroupResponse], error)
 	UpdatePeerGroup(ctx context.Context, in *UpdatePeerGroupRequest, opts ...grpc.CallOption) (*UpdatePeerGroupResponse, error)
+	AddTcpAoKeychain(ctx context.Context, in *AddTcpAoKeychainRequest, opts ...grpc.CallOption) (*AddTcpAoKeychainResponse, error)
+	DeleteTcpAoKeychain(ctx context.Context, in *DeleteTcpAoKeychainRequest, opts ...grpc.CallOption) (*DeleteTcpAoKeychainResponse, error)
+	ListTcpAoKeychain(ctx context.Context, in *ListTcpAoKeychainRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListTcpAoKeychainResponse], error)
 	AddDynamicNeighbor(ctx context.Context, in *AddDynamicNeighborRequest, opts ...grpc.CallOption) (*AddDynamicNeighborResponse, error)
 	ListDynamicNeighbor(ctx context.Context, in *ListDynamicNeighborRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListDynamicNeighborResponse], error)
 	DeleteDynamicNeighbor(ctx context.Context, in *DeleteDynamicNeighborRequest, opts ...grpc.CallOption) (*DeleteDynamicNeighborResponse, error)
@@ -355,6 +361,45 @@ func (c *goBgpServiceClient) UpdatePeerGroup(ctx context.Context, in *UpdatePeer
 	return out, nil
 }
 
+func (c *goBgpServiceClient) AddTcpAoKeychain(ctx context.Context, in *AddTcpAoKeychainRequest, opts ...grpc.CallOption) (*AddTcpAoKeychainResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddTcpAoKeychainResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_AddTcpAoKeychain_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DeleteTcpAoKeychain(ctx context.Context, in *DeleteTcpAoKeychainRequest, opts ...grpc.CallOption) (*DeleteTcpAoKeychainResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteTcpAoKeychainResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DeleteTcpAoKeychain_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) ListTcpAoKeychain(ctx context.Context, in *ListTcpAoKeychainRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListTcpAoKeychainResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[3], GoBgpService_ListTcpAoKeychain_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ListTcpAoKeychainRequest, ListTcpAoKeychainResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_ListTcpAoKeychainClient = grpc.ServerStreamingClient[ListTcpAoKeychainResponse]
+
 func (c *goBgpServiceClient) AddDynamicNeighbor(ctx context.Context, in *AddDynamicNeighborRequest, opts ...grpc.CallOption) (*AddDynamicNeighborResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AddDynamicNeighborResponse)
@@ -367,7 +412,7 @@ func (c *goBgpServiceClient) AddDynamicNeighbor(ctx context.Context, in *AddDyna
 
 func (c *goBgpServiceClient) ListDynamicNeighbor(ctx context.Context, in *ListDynamicNeighborRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListDynamicNeighborResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[3], GoBgpService_ListDynamicNeighbor_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[4], GoBgpService_ListDynamicNeighbor_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +461,7 @@ func (c *goBgpServiceClient) DeletePath(ctx context.Context, in *DeletePathReque
 
 func (c *goBgpServiceClient) ListPath(ctx context.Context, in *ListPathRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListPathResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[4], GoBgpService_ListPath_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[5], GoBgpService_ListPath_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +480,7 @@ type GoBgpService_ListPathClient = grpc.ServerStreamingClient[ListPathResponse]
 
 func (c *goBgpServiceClient) AddPathStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[AddPathStreamRequest, AddPathStreamResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[5], GoBgpService_AddPathStream_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[6], GoBgpService_AddPathStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +523,7 @@ func (c *goBgpServiceClient) DeleteVrf(ctx context.Context, in *DeleteVrfRequest
 
 func (c *goBgpServiceClient) ListVrf(ctx context.Context, in *ListVrfRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListVrfResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[6], GoBgpService_ListVrf_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[7], GoBgpService_ListVrf_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +562,7 @@ func (c *goBgpServiceClient) DeletePolicy(ctx context.Context, in *DeletePolicyR
 
 func (c *goBgpServiceClient) ListPolicy(ctx context.Context, in *ListPolicyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListPolicyResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[7], GoBgpService_ListPolicy_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[8], GoBgpService_ListPolicy_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -566,7 +611,7 @@ func (c *goBgpServiceClient) DeleteDefinedSet(ctx context.Context, in *DeleteDef
 
 func (c *goBgpServiceClient) ListDefinedSet(ctx context.Context, in *ListDefinedSetRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListDefinedSetResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[8], GoBgpService_ListDefinedSet_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[9], GoBgpService_ListDefinedSet_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +650,7 @@ func (c *goBgpServiceClient) DeleteStatement(ctx context.Context, in *DeleteStat
 
 func (c *goBgpServiceClient) ListStatement(ctx context.Context, in *ListStatementRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListStatementResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[9], GoBgpService_ListStatement_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[10], GoBgpService_ListStatement_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +689,7 @@ func (c *goBgpServiceClient) DeletePolicyAssignment(ctx context.Context, in *Del
 
 func (c *goBgpServiceClient) ListPolicyAssignment(ctx context.Context, in *ListPolicyAssignmentRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListPolicyAssignmentResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[10], GoBgpService_ListPolicyAssignment_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[11], GoBgpService_ListPolicyAssignment_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +738,7 @@ func (c *goBgpServiceClient) DeleteRpki(ctx context.Context, in *DeleteRpkiReque
 
 func (c *goBgpServiceClient) ListRpki(ctx context.Context, in *ListRpkiRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListRpkiResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[11], GoBgpService_ListRpki_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[12], GoBgpService_ListRpki_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -742,7 +787,7 @@ func (c *goBgpServiceClient) ResetRpki(ctx context.Context, in *ResetRpkiRequest
 
 func (c *goBgpServiceClient) ListRpkiTable(ctx context.Context, in *ListRpkiTableRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListRpkiTableResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[12], GoBgpService_ListRpkiTable_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[13], GoBgpService_ListRpkiTable_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -811,7 +856,7 @@ func (c *goBgpServiceClient) DeleteBmp(ctx context.Context, in *DeleteBmpRequest
 
 func (c *goBgpServiceClient) ListBmp(ctx context.Context, in *ListBmpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListBmpResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[13], GoBgpService_ListBmp_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[14], GoBgpService_ListBmp_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -860,6 +905,9 @@ type GoBgpServiceServer interface {
 	DeletePeerGroup(context.Context, *DeletePeerGroupRequest) (*DeletePeerGroupResponse, error)
 	ListPeerGroup(*ListPeerGroupRequest, grpc.ServerStreamingServer[ListPeerGroupResponse]) error
 	UpdatePeerGroup(context.Context, *UpdatePeerGroupRequest) (*UpdatePeerGroupResponse, error)
+	AddTcpAoKeychain(context.Context, *AddTcpAoKeychainRequest) (*AddTcpAoKeychainResponse, error)
+	DeleteTcpAoKeychain(context.Context, *DeleteTcpAoKeychainRequest) (*DeleteTcpAoKeychainResponse, error)
+	ListTcpAoKeychain(*ListTcpAoKeychainRequest, grpc.ServerStreamingServer[ListTcpAoKeychainResponse]) error
 	AddDynamicNeighbor(context.Context, *AddDynamicNeighborRequest) (*AddDynamicNeighborResponse, error)
 	ListDynamicNeighbor(*ListDynamicNeighborRequest, grpc.ServerStreamingServer[ListDynamicNeighborResponse]) error
 	DeleteDynamicNeighbor(context.Context, *DeleteDynamicNeighborRequest) (*DeleteDynamicNeighborResponse, error)
@@ -956,6 +1004,15 @@ func (UnimplementedGoBgpServiceServer) ListPeerGroup(*ListPeerGroupRequest, grpc
 }
 func (UnimplementedGoBgpServiceServer) UpdatePeerGroup(context.Context, *UpdatePeerGroupRequest) (*UpdatePeerGroupResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdatePeerGroup not implemented")
+}
+func (UnimplementedGoBgpServiceServer) AddTcpAoKeychain(context.Context, *AddTcpAoKeychainRequest) (*AddTcpAoKeychainResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddTcpAoKeychain not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DeleteTcpAoKeychain(context.Context, *DeleteTcpAoKeychainRequest) (*DeleteTcpAoKeychainResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteTcpAoKeychain not implemented")
+}
+func (UnimplementedGoBgpServiceServer) ListTcpAoKeychain(*ListTcpAoKeychainRequest, grpc.ServerStreamingServer[ListTcpAoKeychainResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method ListTcpAoKeychain not implemented")
 }
 func (UnimplementedGoBgpServiceServer) AddDynamicNeighbor(context.Context, *AddDynamicNeighborRequest) (*AddDynamicNeighborResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AddDynamicNeighbor not implemented")
@@ -1361,6 +1418,53 @@ func _GoBgpService_UpdatePeerGroup_Handler(srv interface{}, ctx context.Context,
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _GoBgpService_AddTcpAoKeychain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddTcpAoKeychainRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).AddTcpAoKeychain(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_AddTcpAoKeychain_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).AddTcpAoKeychain(ctx, req.(*AddTcpAoKeychainRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DeleteTcpAoKeychain_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteTcpAoKeychainRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DeleteTcpAoKeychain(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DeleteTcpAoKeychain_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DeleteTcpAoKeychain(ctx, req.(*DeleteTcpAoKeychainRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_ListTcpAoKeychain_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ListTcpAoKeychainRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GoBgpServiceServer).ListTcpAoKeychain(m, &grpc.GenericServerStream[ListTcpAoKeychainRequest, ListTcpAoKeychainResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_ListTcpAoKeychainServer = grpc.ServerStreamingServer[ListTcpAoKeychainResponse]
 
 func _GoBgpService_AddDynamicNeighbor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AddDynamicNeighborRequest)
@@ -2043,6 +2147,14 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GoBgpService_UpdatePeerGroup_Handler,
 		},
 		{
+			MethodName: "AddTcpAoKeychain",
+			Handler:    _GoBgpService_AddTcpAoKeychain_Handler,
+		},
+		{
+			MethodName: "DeleteTcpAoKeychain",
+			Handler:    _GoBgpService_DeleteTcpAoKeychain_Handler,
+		},
+		{
 			MethodName: "AddDynamicNeighbor",
 			Handler:    _GoBgpService_AddDynamicNeighbor_Handler,
 		},
@@ -2169,6 +2281,11 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ListPeerGroup",
 			Handler:       _GoBgpService_ListPeerGroup_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ListTcpAoKeychain",
+			Handler:       _GoBgpService_ListTcpAoKeychain_Handler,
 			ServerStreams: true,
 		},
 		{

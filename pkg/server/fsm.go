@@ -406,6 +406,9 @@ type fsm struct {
 	// mostly read config
 	// config state messages statistics and timers state UpdateRecvTime are atomic
 	pConf pConfAccess
+	// tcpAoConfig is an immutable effective attachment snapshot. It contains
+	// secrets and must never be copied into public peer configuration or logs.
+	tcpAoConfig *tcpAoSocketConfig
 
 	capMap   map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface
 	recvOpen *bgp.BGPMessage
@@ -919,6 +922,20 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 		}
 		return tick, addr.String(), port, password, ttl, ttlMin, conf.Transport.Config.TcpMss, conf.Transport.Config.LocalAddress.String(), int(conf.Transport.Config.LocalPort), conf.Transport.Config.BindInterface, tos
 	}()
+	tcpAoConfig := fsm.tcpAoConfig
+	var tcpAoPeer netip.Prefix
+	if tcpAoConfig != nil {
+		peerAddr, err := netip.ParseAddr(addr)
+		if err != nil {
+			fsm.logger.Error("invalid TCP-AO peer address", slog.String("Error", err.Error()))
+			return nil
+		}
+		tcpAoPeer, err = tcpAoExactPeerPrefix(peerAddr)
+		if err != nil {
+			fsm.logger.Error("invalid TCP-AO peer scope", slog.String("Error", err.Error()))
+			return nil
+		}
+	}
 
 	tick := minConnectRetryInterval
 	for {
@@ -943,8 +960,20 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 				Timeout:   time.Duration(max(retryInterval-1, minConnectRetryInterval)) * time.Second,
 				KeepAlive: -1,
 				Control: func(network, address string, c syscall.RawConn) error {
-					return netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos)
+					if err := netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos); err != nil {
+						return err
+					}
+					if tcpAoConfig != nil {
+						if err := addTcpAoDialerKeys(c, tcpAoPeer, tcpAoConfig); err != nil {
+							return fmt.Errorf("failed to configure TCP-AO for peer %s: %w", addr, err)
+						}
+					}
+					return nil
 				},
+			}
+			if tcpAoConfig != nil {
+				// TCP-AO is configured on ordinary TCP sockets rather than MPTCP.
+				d.SetMultipathTCP(false)
 			}
 
 			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr, strconv.Itoa(port)))
@@ -2182,6 +2211,10 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 		oldState = nextState
 	}
 
+	if fsm.outgoingConnMgr != nil {
+		fsm.outgoingConnMgr.stop()
+		fsm.outgoingConnMgr = nil
+	}
 	select {
 	case conn := <-fsm.connCh:
 		conn.Close()
@@ -2192,6 +2225,10 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 	}
 	close(fsm.connCh)
 	cleanInfiniteChannel(fsm.outgoingCh)
+	fsm.lock.Lock()
+	clearTcpAoSocketConfig(fsm.tcpAoConfig)
+	fsm.tcpAoConfig = nil
+	fsm.lock.Unlock()
 }
 
 func (h *fsmHandler) changeadminState(s adminState) error {

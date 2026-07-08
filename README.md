@@ -53,6 +53,10 @@ Try [a binary release](https://github.com/osrg/gobgp/releases/latest).
   - [Unnumbered BGP](docs/sources/unnumbered-bgp.md)
 - [Sentry](docs/sources/sentry.md)
 
+### Design records
+
+- [TCP Authentication Option (TCP-AO)](docs/sources/tcp-ao.md)
+
 ### Externals
 
 - [Tutorial: Using GoBGP as an IXP connecting router](http://www.slideshare.net/shusugimoto1986/tutorial-using-gobgp-as-an-ixp-connecting-router)

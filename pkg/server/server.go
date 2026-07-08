@@ -143,6 +143,7 @@ type BgpServer struct {
 	listeners    []*netutils.TCPListener
 	neighborMap  map[netip.Addr]*peer
 	peerGroupMap map[string]*peerGroup
+	tcpAoChains  map[string]*tcpAoKeychain
 	globalRib    *table.TableManager
 	rsRib        *table.TableManager
 	roaManager   *roaManager
@@ -184,6 +185,7 @@ func NewBgpServer(opt ...ServerOption) *BgpServer {
 		shared:       shared,
 		neighborMap:  make(map[netip.Addr]*peer),
 		peerGroupMap: make(map[string]*peerGroup),
+		tcpAoChains:  make(map[string]*tcpAoKeychain),
 		policy:       table.NewRoutingPolicy(logger),
 		mgmtCh:       make(chan *mgmtOp, 1),
 		closeCh:      make(chan struct{}),
@@ -338,6 +340,14 @@ func (s *BgpServer) passConnToPeer(conn net.Conn) {
 		if !localAddrValid {
 			conn.Close()
 			return
+		}
+		if peer.fsm.tcpAoConfig != nil {
+			if err := setTcpAoConnectionSelection(conn, peer.fsm.tcpAoConfig); err != nil {
+				peer.fsm.logger.Warn("rejected a connection that could not be configured for TCP-AO",
+					slog.String("Error", err.Error()))
+				conn.Close()
+				return
+			}
 		}
 
 		peer.fsm.logger.Debug("Accepted a new passive connection")
@@ -2154,6 +2164,7 @@ func (s *BgpServer) StopBgp(ctx context.Context, r *api.StopBgpRequest) error {
 		for _, l := range s.listeners {
 			l.Close()
 		}
+		s.clearTcpAoKeychains()
 		s.bgpConfig.Global = oc.Global{}
 		return nil
 	}, false)
@@ -3312,6 +3323,7 @@ func (s *BgpServer) ListPeerGroup(ctx context.Context, r *api.ListPeerGroupReque
 				continue
 			}
 			pg := oc.NewPeerGroupFromConfigStruct(group.Conf)
+			pg.Conf.TcpAo = group.tcpAoAttachment.api()
 			l = append(l, pg)
 		}
 		return nil
@@ -3345,6 +3357,7 @@ func (s *BgpServer) ListPeer(ctx context.Context, r *api.ListPeerRequest, fn fun
 			}
 			// FIXME: should remove toConfig() conversion
 			p := oc.NewPeerFromConfigStruct(s.toConfig(peer, getAdvertised))
+			p.Conf.TcpAo = peer.tcpAoAttachment.api()
 			for _, family := range peer.configuredRFlist() {
 				for i, afisafi := range p.AfiSafis {
 					if !afisafi.Config.Enabled {
@@ -3408,7 +3421,7 @@ func (s *BgpServer) addPeerGroup(c *oc.PeerGroup) error {
 	return nil
 }
 
-func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
+func (s *BgpServer) addNeighbor(c *oc.Neighbor, explicitTcpAo *tcpAoAttachment) error {
 	addr, err := c.ExtractNeighborAddress()
 	if err != nil {
 		return err
@@ -3418,17 +3431,38 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		return fmt.Errorf("can't overwrite the existing peer: %s", addr)
 	}
 
+	var pg *peerGroup
 	var pgConf *oc.PeerGroup
 	if c.Config.PeerGroup != "" {
-		pg, ok := s.peerGroupMap[c.Config.PeerGroup]
+		var ok bool
+		pg, ok = s.peerGroupMap[c.Config.PeerGroup]
 		if !ok {
 			return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
 		}
 		pgConf = pg.Conf
 	}
+	effectiveTcpAo := effectiveTcpAoAttachment(explicitTcpAo, pg)
+	tcpAoConfig, err := s.newTcpAoSocketConfig(effectiveTcpAo)
+	if err != nil {
+		return err
+	}
+	tcpAoConfigOwnedByPeer := false
+	defer func() {
+		if !tcpAoConfigOwnedByPeer {
+			clearTcpAoSocketConfig(tcpAoConfig)
+		}
+	}()
 
 	if err := oc.SetDefaultNeighborConfigValues(c, pgConf, &s.bgpConfig.Global); err != nil {
 		return err
+	}
+	if tcpAoConfig != nil {
+		if c.Config.AuthPassword != "" {
+			return status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+		}
+		if c.Config.Vrf != "" || c.Config.NeighborInterface != "" {
+			return status.Error(codes.Unimplemented, "TCP-AO VRF and link-local/unnumbered peers are outside the MVP")
+		}
 	}
 
 	if vrf := c.Config.Vrf; vrf != "" {
@@ -3451,8 +3485,23 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		return fmt.Errorf("can't be both route-server-client and route-reflector-client")
 	}
 
+	var tcpAoPeer netip.Prefix
+	if tcpAoConfig != nil {
+		tcpAoPeer, err = tcpAoExactPeerPrefix(netip.MustParseAddr(addr))
+		if err != nil {
+			return err
+		}
+	}
 	if s.bgpConfig.Global.Config.Port > 0 {
 		for _, l := range s.listListeners(addr) {
+			if tcpAoConfig != nil {
+				if err := addTcpAoListenerKeys(l, tcpAoPeer, tcpAoConfig); err != nil {
+					s.logger.Warn("failed to set TCP-AO",
+						slog.String("Topic", "Peer"),
+						slog.String("Key", addr),
+						slog.String("Err", err.Error()))
+				}
+			}
 			if c.Config.AuthPassword != "" {
 				if err := netutils.SetTCPMD5SigSockopt(l, c.Transport.Config.BindInterface, addr, c.Config.AuthPassword); err != nil {
 					s.logger.Warn("failed to set md5",
@@ -3472,9 +3521,12 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		rib = s.rsRib
 	}
 	peer := newPeer(&s.bgpConfig.Global, c, bgp.BGP_FSM_IDLE, rib, s.policy, s.logger)
+	peer.tcpAoAttachment = explicitTcpAo.clone()
+	peer.fsm.tcpAoConfig = tcpAoConfig
 	if err := s.policy.SetPeerPolicy(peer.ID(), c.ApplyPolicy); err != nil {
 		return fmt.Errorf("failed to set peer policy for %s: %v", addr, err)
 	}
+	tcpAoConfigOwnedByPeer = true
 	s.neighborMap[netip.MustParseAddr(addr)] = peer
 	if name := c.Config.PeerGroup; name != "" {
 		s.peerGroupMap[name].AddMember(*c)
@@ -3548,7 +3600,18 @@ func (s *BgpServer) AddPeerGroup(ctx context.Context, r *api.AddPeerGroupRequest
 		if err != nil {
 			return err
 		}
-		return s.addPeerGroup(c)
+		if c.Config.AuthPassword != "" && r.PeerGroup.Conf != nil && r.PeerGroup.Conf.TcpAo != nil && r.PeerGroup.Conf.TcpAo.Keychain != "" {
+			return status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+		}
+		attachment, err := s.newTcpAoAttachment(r.PeerGroup.GetConf().GetTcpAo())
+		if err != nil {
+			return err
+		}
+		if err := s.addPeerGroup(c); err != nil {
+			return err
+		}
+		s.peerGroupMap[c.Config.PeerGroupName].tcpAoAttachment = attachment
+		return nil
 	}, true)
 }
 
@@ -3561,7 +3624,14 @@ func (s *BgpServer) AddPeer(ctx context.Context, r *api.AddPeerRequest) error {
 		if err != nil {
 			return err
 		}
-		return s.addNeighbor(c)
+		var attachment *tcpAoAttachment
+		if r.Peer.Conf != nil {
+			attachment, err = s.newTcpAoAttachment(r.Peer.Conf.TcpAo)
+			if err != nil {
+				return err
+			}
+		}
+		return s.addNeighbor(c, attachment)
 	}, true)
 }
 
@@ -3581,9 +3651,13 @@ func (s *BgpServer) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNei
 				PeerGroup: r.DynamicNeighbor.PeerGroup,
 			},
 		}
-		s.peerGroupMap[c.Config.PeerGroup].AddDynamicNeighbor(c)
+		group := s.peerGroupMap[c.Config.PeerGroup]
+		if group.tcpAoAttachment != nil {
+			return status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are outside the MVP")
+		}
+		group.AddDynamicNeighbor(c)
 
-		pConf := s.peerGroupMap[c.Config.PeerGroup].Conf
+		pConf := group.Conf
 		if pConf.Config.AuthPassword != "" {
 			prefix := r.DynamicNeighbor.Prefix
 			addr, _, _ := net.ParseCIDR(prefix)
@@ -3619,13 +3693,6 @@ func (s *BgpServer) deletePeerGroup(name string) error {
 }
 
 func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNotification bool) error {
-	if c.Config.PeerGroup != "" {
-		_, y := s.peerGroupMap[c.Config.PeerGroup]
-		if y {
-			s.peerGroupMap[c.Config.PeerGroup].DeleteMember(*c)
-		}
-	}
-
 	addr, err := c.ExtractNeighborAddress()
 	if err != nil {
 		return err
@@ -3642,11 +3709,29 @@ func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNoti
 	if !y {
 		return fmt.Errorf("can't delete a peer configuration for %s", addr)
 	}
+	configured := n.fsm.pConf.ReadOnly()
+	var tcpAoPeer netip.Prefix
+	if n.fsm.tcpAoConfig != nil {
+		tcpAoPeer, err = tcpAoExactPeerPrefix(netip.MustParseAddr(addr))
+		if err != nil {
+			return err
+		}
+	}
 	for _, l := range s.listListeners(addr) {
+		if n.fsm.tcpAoConfig != nil {
+			if err := deleteTcpAoListenerKeys(l, tcpAoPeer, n.fsm.tcpAoConfig); err != nil {
+				n.fsm.logger.Warn("failed to unset TCP-AO", slog.String("Err", err.Error()))
+			}
+		}
 		if c.Config.AuthPassword != "" {
 			if err := netutils.SetTCPMD5SigSockopt(l, c.Transport.Config.BindInterface, addr, ""); err != nil {
 				n.fsm.logger.Warn("failed to unset md5", slog.String("Err", err.Error()))
 			}
+		}
+	}
+	if configured.Config.PeerGroup != "" {
+		if group, ok := s.peerGroupMap[configured.Config.PeerGroup]; ok {
+			group.DeleteMember(*configured)
 		}
 	}
 	n.fsm.logger.Info("Delete a peer configuration")
@@ -3723,17 +3808,48 @@ func (s *BgpServer) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDyna
 	}, true)
 }
 
-func (s *BgpServer) updatePeerGroup(pg *oc.PeerGroup) (needsSoftResetIn bool, err error) {
+func (s *BgpServer) updatePeerGroup(pg *oc.PeerGroup, tcpAo *tcpAoAttachment) (needsSoftResetIn bool, err error) {
 	name := pg.Config.PeerGroupName
 
-	_, ok := s.peerGroupMap[name]
+	group, ok := s.peerGroupMap[name]
 	if !ok {
 		return false, fmt.Errorf("peer-group %s doesn't exist", name)
 	}
-	s.peerGroupMap[name].Conf = pg
+	if !group.tcpAoAttachment.equal(tcpAo) {
+		if len(group.members) != 0 {
+			return false, status.Error(codes.FailedPrecondition, "TCP-AO attachment cannot be changed while the peer-group has members; delete and re-add the peers first")
+		}
+		if len(group.dynamicNeighbors) != 0 {
+			return false, status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are outside the MVP")
+		}
+	}
+	if tcpAo != nil && pg.Config.AuthPassword != "" {
+		return false, status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+	}
+	if pg.Config.AuthPassword != "" {
+		for _, member := range group.members {
+			addr, err := member.ExtractNeighborAddress()
+			if err != nil {
+				return false, err
+			}
+			peer, ok := s.neighborMap[netip.MustParseAddr(addr)]
+			if !ok {
+				continue
+			}
+			effectiveTcpAo := peer.tcpAoAttachment
+			if effectiveTcpAo == nil {
+				effectiveTcpAo = tcpAo
+			}
+			if effectiveTcpAo != nil {
+				return false, status.Errorf(codes.InvalidArgument, "peer-group TCP-MD5 authentication conflicts with TCP-AO on member %s", addr)
+			}
+		}
+	}
+	group.Conf = pg
+	group.tcpAoAttachment = tcpAo.clone()
 
-	for _, n := range s.peerGroupMap[name].members {
-		u, err := s.updateNeighbor(&n)
+	for _, member := range group.members {
+		u, err := s.updateNeighbor(&member, nil, false)
 		if err != nil {
 			return needsSoftResetIn, err
 		}
@@ -3752,16 +3868,29 @@ func (s *BgpServer) UpdatePeerGroup(ctx context.Context, r *api.UpdatePeerGroupR
 		if err != nil {
 			return err
 		}
-		doSoftreset, err = s.updatePeerGroup(pg)
+		group, ok := s.peerGroupMap[pg.Config.PeerGroupName]
+		if !ok {
+			return fmt.Errorf("peer-group %s doesn't exist", pg.Config.PeerGroupName)
+		}
+		attachment := group.tcpAoAttachment.clone()
+		if r.PeerGroup.Conf != nil && r.PeerGroup.Conf.TcpAo != nil {
+			attachment, err = s.newTcpAoAttachment(r.PeerGroup.Conf.TcpAo)
+			if err != nil {
+				return err
+			}
+		}
+		doSoftreset, err = s.updatePeerGroup(pg, attachment)
 		return err
 	}, true)
 	return &api.UpdatePeerGroupResponse{NeedsSoftResetIn: doSoftreset}, err
 }
 
-func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err error) {
+func (s *BgpServer) updateNeighbor(c *oc.Neighbor, requestedTcpAo *tcpAoAttachment, tcpAoPresent bool) (needsSoftResetIn bool, err error) {
+	var pg *peerGroup
 	var pgConf *oc.PeerGroup
 	if c.Config.PeerGroup != "" {
-		if pg, ok := s.peerGroupMap[c.Config.PeerGroup]; ok {
+		if configuredGroup, ok := s.peerGroupMap[c.Config.PeerGroup]; ok {
+			pg = configuredGroup
 			pgConf = pg.Conf
 		} else {
 			return needsSoftResetIn, fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
@@ -3779,6 +3908,22 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 	peer, ok := s.neighborMap[netip.MustParseAddr(addr)]
 	if !ok {
 		return needsSoftResetIn, fmt.Errorf("neighbor that has %v doesn't exist", addr)
+	}
+	newExplicitTcpAo := peer.tcpAoAttachment.clone()
+	if tcpAoPresent {
+		newExplicitTcpAo = requestedTcpAo.clone()
+	}
+	newEffectiveTcpAo := effectiveTcpAoAttachment(newExplicitTcpAo, pg)
+	if !peer.fsm.tcpAoConfig.matchesAttachment(newEffectiveTcpAo) {
+		return needsSoftResetIn, status.Error(codes.FailedPrecondition, "TCP-AO attachment cannot be changed with UpdatePeer; delete and re-add the peer")
+	}
+	if newEffectiveTcpAo != nil {
+		if c.Config.AuthPassword != "" {
+			return needsSoftResetIn, status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+		}
+		if c.Config.Vrf != "" || c.Config.NeighborInterface != "" {
+			return needsSoftResetIn, status.Error(codes.Unimplemented, "TCP-AO VRF and link-local/unnumbered peers are outside the MVP")
+		}
 	}
 
 	peer.fsm.lock.Lock()
@@ -3837,7 +3982,7 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 			peer.fsm.logger.Error("failed to delete neighbor", slog.String("Err", err.Error()))
 			return needsSoftResetIn, err
 		}
-		err = s.addNeighbor(c)
+		err = s.addNeighbor(c, newExplicitTcpAo)
 		if err != nil {
 			// rollback to original ApplyPolicy
 			peer.fsm.pConf.Update(original)
@@ -3854,6 +3999,7 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 
 	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
 	if err == nil {
+		peer.tcpAoAttachment = newExplicitTcpAo
 		peer.fsm.pConf.Update(&conf)
 		peer.fsm.lock.Unlock()
 		if bfdConfigChanged {
@@ -3889,7 +4035,15 @@ func (s *BgpServer) UpdatePeer(ctx context.Context, r *api.UpdatePeerRequest) (r
 		if err != nil {
 			return err
 		}
-		doSoftReset, err = s.updateNeighbor(c)
+		var attachment *tcpAoAttachment
+		present := r.Peer.Conf != nil && r.Peer.Conf.TcpAo != nil
+		if present {
+			attachment, err = s.newTcpAoAttachment(r.Peer.Conf.TcpAo)
+			if err != nil {
+				return err
+			}
+		}
+		doSoftReset, err = s.updateNeighbor(c, attachment, present)
 		return err
 	}, true)
 	return &api.UpdatePeerResponse{NeedsSoftResetIn: doSoftReset}, err

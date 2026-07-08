@@ -54,6 +54,10 @@ service GoBgpService {
   rpc ListPeerGroup(ListPeerGroupRequest) returns (stream ListPeerGroupResponse);
   rpc UpdatePeerGroup(UpdatePeerGroupRequest) returns (UpdatePeerGroupResponse);
 
+  rpc AddTcpAoKeychain(AddTcpAoKeychainRequest) returns (AddTcpAoKeychainResponse);
+  rpc DeleteTcpAoKeychain(DeleteTcpAoKeychainRequest) returns (DeleteTcpAoKeychainResponse);
+  rpc ListTcpAoKeychain(ListTcpAoKeychainRequest) returns (stream ListTcpAoKeychainResponse);
+
   rpc AddDynamicNeighbor(AddDynamicNeighborRequest) returns (AddDynamicNeighborResponse);
   rpc ListDynamicNeighbor(ListDynamicNeighborRequest) returns (stream ListDynamicNeighborResponse);
   rpc DeleteDynamicNeighbor(DeleteDynamicNeighborRequest) returns (DeleteDynamicNeighborResponse);
@@ -767,6 +771,7 @@ message PeerConf {
   bool admin_down = 15;
   bool send_software_version = 16;
   bool allow_aspath_loop_local = 17;
+  TcpAoKeyAttachment tcp_ao = 18;
 }
 
 message PeerGroupConf {
@@ -783,6 +788,7 @@ message PeerGroupConf {
   uint32 allow_own_asn = 11;
   bool replace_peer_asn = 12;
   bool allow_aspath_loop_local = 13;
+  TcpAoKeyAttachment tcp_ao = 14;
 }
 
 message PeerGroupState {
@@ -1441,4 +1447,56 @@ message BfdState {
   uint64 received_error = 3;
   uint64 invalid_packet = 4;
   uint64 unknown_peer = 5;
+}
+
+enum TcpAoAlgorithm {
+  TCP_AO_ALGORITHM_UNSPECIFIED = 0;
+  TCP_AO_ALGORITHM_HMAC_SHA1_96 = 1;
+  TCP_AO_ALGORITHM_AES_128_CMAC_96 = 2;
+}
+
+message TcpAoKey {
+  // Send and receive IDs are independent unsigned 8-bit namespaces.
+  uint32 send_id = 1;
+  uint32 receive_id = 2;
+  TcpAoAlgorithm algorithm = 3;
+  // Write-only. GoBGP never returns master-key bytes from Add or List.
+  bytes master_key = 4 [debug_redact = true];
+  // False authenticates TCP options, which is the RFC 5925 default.
+  bool exclude_tcp_options = 5;
+}
+
+message TcpAoKeychain {
+  string name = 1;
+  repeated TcpAoKey keys = 2;
+}
+
+message AddTcpAoKeychainRequest {
+  TcpAoKeychain keychain = 1;
+}
+
+message AddTcpAoKeychainResponse {
+  TcpAoKeychain keychain = 1;
+}
+
+message DeleteTcpAoKeychainRequest {
+  string name = 1;
+}
+
+message DeleteTcpAoKeychainResponse {}
+
+message ListTcpAoKeychainRequest {
+  string name = 1;
+}
+
+message ListTcpAoKeychainResponse {
+  TcpAoKeychain keychain = 1;
+}
+
+message TcpAoKeyAttachment {
+  // Empty resets the explicit attachment (and therefore restores peer-group
+  // inheritance for a grouped peer).
+  string keychain = 1;
+  // Required when the selected keychain contains more than one key.
+  optional uint32 preferred_send_id = 2;
 }
