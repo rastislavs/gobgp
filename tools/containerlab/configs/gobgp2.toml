@@ -1,0 +1,13 @@
+[global.config]
+  as = 65002
+  router-id = "192.0.2.2"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "10.0.0.1"
+    peer-as = 65001
+  [neighbors.timers.config]
+    connect-retry = 3
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"

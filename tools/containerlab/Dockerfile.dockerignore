@@ -1,0 +1,14 @@
+.git
+.github
+.agents
+.codex
+.idea
+.vscode
+.env
+clab-*
+**/clab-*
+docs
+test
+tools
+*.prof
+*.test

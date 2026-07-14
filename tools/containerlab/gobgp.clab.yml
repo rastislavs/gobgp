@@ -1,0 +1,47 @@
+name: gobgp
+
+topology:
+  defaults:
+    kind: linux
+    image: gobgp:local
+    image-pull-policy: Never
+    restart-policy: "no"
+    cmd: -f /etc/gobgp/gobgpd.toml
+
+  nodes:
+    gobgp1:
+      binds:
+        - configs/gobgp1.toml:/etc/gobgp/gobgpd.toml:ro
+      exec:
+        - ip link set dev eth1 up
+        - ip address replace 10.0.0.1/30 dev eth1
+        - timeout 30 sh -c 'until gobgp global >/dev/null 2>&1; do sleep 1; done'
+        - gobgp global rib add 198.51.100.0/24
+      healthcheck:
+        test:
+          - CMD-SHELL
+          - gobgp neighbor 10.0.0.2 | grep -q ESTABLISHED && gobgp global rib 203.0.113.0/24 | grep -q 65002
+        start-period: 5
+        interval: 5
+        timeout: 5
+        retries: 12
+
+    gobgp2:
+      binds:
+        - configs/gobgp2.toml:/etc/gobgp/gobgpd.toml:ro
+      exec:
+        - ip link set dev eth1 up
+        - ip address replace 10.0.0.2/30 dev eth1
+        - timeout 30 sh -c 'until gobgp global >/dev/null 2>&1; do sleep 1; done'
+        - gobgp global rib add 203.0.113.0/24
+      healthcheck:
+        test:
+          - CMD-SHELL
+          - gobgp neighbor 10.0.0.1 | grep -q ESTABLISHED && gobgp global rib 198.51.100.0/24 | grep -q 65001
+        start-period: 5
+        interval: 5
+        timeout: 5
+        retries: 12
+
+  links:
+    - endpoints: ["gobgp1:eth1", "gobgp2:eth1"]
