@@ -16,6 +16,7 @@ gobgp has the following subcommands.
 - [vrf](#4-vrf-subcommand)
 - [monitor](#5-monitor-subcommand)
 - [mrt](#6-mrt-subcommand)
+- [keychain](#7-keychain-subcommand)
 
 ## 1. global subcommand
 
@@ -121,13 +122,20 @@ Also, refer to the following for the detail syntax of each address family.
 % gobgp neighbor <neighbor address>
 ```
 
+For a TCP-AO peer, the detailed output includes the configured keychain and
+live socket key state, including current and receive-next selection and packet
+counters. A synchronization error is shown only when live socket application
+fails. JSON output exposes the full status in `state.tcp_ao`.
+
 ### 2.2. Operations for neighbor - shutdown/reset/softreset/enable/disable -
 
 #### - syntax
 
 ```shell
 # add neighbor
-% gobgp neighbor add { <neighbor address> | interface <ifname> } as <as number> [ local-as <as number> | vrf <vrf-name> | route-reflector-client [<cluster-id>] | route-server-client | allow-own-as <num> | remove-private-as (all|replace) | replace-peer-as | ebgp-multihop-ttl <ttl>]
+% gobgp neighbor add { <neighbor address> | interface <ifname> } as <as number> [ local-as <as number> | vrf <vrf-name> | route-reflector-client [<cluster-id>] | route-server-client | allow-own-as <num> | remove-private-as (all|replace) | replace-peer-as | ebgp-multihop-ttl <ttl> | tcp-ao-keychain <name> | tcp-ao-preferred-send-id <0..255>]
+# update neighbor configuration
+% gobgp neighbor update { <neighbor address> | interface <ifname> } [ as <as number> | local-as <as number> | vrf <vrf-name> | route-reflector-client [<cluster-id>] | route-server-client | allow-own-as <num> | remove-private-as (all|replace) | replace-peer-as | ebgp-multihop-ttl <ttl> | tcp-ao-keychain <name> | tcp-ao-preferred-send-id <0..255>]
 # delete neighbor
 % gobgp neighbor del { <neighbor address> | interface <ifname> }
 % gobgp neighbor <neighbor address> softreset [-a <address family>]
@@ -629,3 +637,25 @@ If you want to remove one element(extended community) of ExtCommunitySet, to spe
 #### Example
 
 see [MRT](mrt.md).
+
+## 7. keychain subcommand
+
+### 7.1 Manage TCP-AO keychains
+
+#### Syntax
+
+```shell
+# list all keychains or one named keychain
+% gobgp keychain [<name>]
+# create a keychain; --key is repeatable
+% gobgp keychain add <name> --key <send-id>,<receive-id>,<algorithm>,<base64-master-key>[,exclude-tcp-options]
+# atomically add and delete keys; both options are repeatable
+% gobgp keychain update <name> [--add-key <send-id>,<receive-id>,<algorithm>,<base64-master-key>[,exclude-tcp-options>] [--delete-key <send-id>,<receive-id>]
+# delete an unreferenced keychain
+% gobgp keychain del <name>
+```
+
+Supported algorithm names are `hmac-sha-1-96`, `aes-128-cmac-96`,
+`hmac-sha-256-96`, and `hmac-sha-256-128`.
+See [TCP Authentication Option (TCP-AO)](tcp-ao.md) for configuration,
+lifecycle, and security details.
