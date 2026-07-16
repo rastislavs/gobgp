@@ -113,6 +113,32 @@ func getLocalASN(p *api.Peer) string {
 	return asn
 }
 
+func formatTcpAoPeerState(state *api.TcpAoPeerState) string {
+	if state == nil {
+		return ""
+	}
+	// The kernel returns TCP-AO keys in its internal traversal order, so sort a
+	// copy to keep the human-readable output stable without changing API state.
+	keys := append([]*api.TcpAoKeyState(nil), state.Keys...)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].SendId != keys[j].SendId {
+			return keys[i].SendId < keys[j].SendId
+		}
+		return keys[i].ReceiveId < keys[j].ReceiveId
+	})
+	var output strings.Builder
+	fmt.Fprintf(&output, "  TCP-AO socket counters:\n")
+	fmt.Fprintf(&output, "    Key not found: %d, AO required: %d, Dropped ICMP: %d\n",
+		state.PacketsKeyNotFound, state.PacketsAoRequired, state.PacketsDroppedIcmp)
+	fmt.Fprintf(&output, "  TCP-AO socket key state:\n")
+	fmt.Fprintf(&output, "    %7s %10s %7s %12s %12s %11s\n", "Send ID", "Receive ID", "Current", "Receive next", "Packets good", "Packets bad")
+	for _, key := range keys {
+		fmt.Fprintf(&output, "    %7d %10d %7t %12t %12d %11d\n",
+			key.SendId, key.ReceiveId, key.Current, key.ReceiveNext, key.PacketsGood, key.PacketsBad)
+	}
+	return output.String()
+}
+
 func counter(p *api.Peer) (uint64, uint64, uint64, error) {
 	accepted := uint64(0)
 	received := uint64(0)
@@ -289,6 +315,10 @@ func showNeighbor(args []string) error {
 	}
 	fmt.Printf("  BGP OutQ = %d, Flops = %d\n", p.State.Queues.Output, p.State.Flops)
 	fmt.Printf("  Local address is %s, local ASN: %s\n", p.Transport.LocalAddress, getLocalASN(p))
+	if tcpAo := p.GetTcpAo(); tcpAo != nil {
+		fmt.Printf("  TCP-AO keychain is %s, preferred send ID: %d\n", tcpAo.GetKeychain(), tcpAo.GetPreferredSendId())
+	}
+	fmt.Print(formatTcpAoPeerState(p.State.GetTcpAoState()))
 	fmt.Printf("  Hold time is %d, keepalive interval is %d seconds\n", int(p.Timers.State.NegotiatedHoldTime), int(p.Timers.State.KeepaliveInterval))
 	fmt.Printf("  Configured hold time is %d, keepalive interval is %d seconds\n", int(p.Timers.Config.HoldTime), int(p.Timers.Config.KeepaliveInterval))
 
@@ -1298,7 +1328,9 @@ func modNeighbor(cmdType string, args []string) error {
 		params["replace-peer-as"] = paramFlag
 		params["ebgp-multihop-ttl"] = paramSingle
 		params["peer-group"] = paramSingle
-		usage += " [ local-as <VALUE> | family <address-families-list> | vrf <vrf-name> | route-reflector-client [<cluster-id>] | route-server-client | allow-own-as <num> | remove-private-as (all|replace) | replace-peer-as | ebgp-multihop-ttl <ttl> | peer-group <peer-group-name>]"
+		params["tcp-ao-keychain"] = paramSingle
+		params["tcp-ao-preferred-send-id"] = paramSingle
+		usage += " [ local-as <VALUE> | family <address-families-list> | vrf <vrf-name> | route-reflector-client [<cluster-id>] | route-server-client | allow-own-as <num> | remove-private-as (all|replace) | replace-peer-as | ebgp-multihop-ttl <ttl> | peer-group <peer-group-name> | tcp-ao-keychain <name> | tcp-ao-preferred-send-id <0..255>]"
 	}
 
 	m, err := extractReserved(args, params)
@@ -1333,6 +1365,7 @@ func modNeighbor(cmdType string, args []string) error {
 				State:          &api.PeerState{},
 				RouteServer:    &api.RouteServer{},
 				RouteReflector: &api.RouteReflector{},
+				Transport:      &api.Transport{},
 			}
 			if unnumbered {
 				peer.Conf.NeighborInterface = m["interface"][0]
@@ -1421,6 +1454,23 @@ func modNeighbor(cmdType string, args []string) error {
 		}
 		if len(m["peer-group"]) == 1 {
 			peer.Conf.PeerGroup = m["peer-group"][0]
+		}
+		if len(m["tcp-ao-keychain"]) == 1 || len(m["tcp-ao-preferred-send-id"]) == 1 {
+			attachment := peer.TcpAo
+			if attachment == nil {
+				attachment = &api.TcpAoPeerConfig{}
+			}
+			if len(m["tcp-ao-keychain"]) == 1 {
+				attachment.Keychain = m["tcp-ao-keychain"][0]
+			}
+			if len(m["tcp-ao-preferred-send-id"]) == 1 {
+				preferred, err := parseTcpAoID(m["tcp-ao-preferred-send-id"][0])
+				if err != nil {
+					return err
+				}
+				attachment.PreferredSendId = preferred
+			}
+			peer.TcpAo = attachment
 		}
 		return nil
 	}
