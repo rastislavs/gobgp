@@ -4006,11 +4006,28 @@ func TestUpdatePeer(t *testing.T) {
 	err = s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: p})
 	assert.NoError(t, err)
 
-	// update timer config
+	// ListPeer reports the operational local address, even when the configured
+	// address is the implicit wildcard. A CLI-style round trip must not turn
+	// that operational value into a configuration change and recreate the peer.
+	peerAddress := netip.MustParseAddr("2.2.2.2")
+	peer := s.neighborMap[peerAddress]
+	require.NotNil(t, peer)
+	configured := peer.fsm.pConf.ReadCopy()
+	require.True(t, configured.Transport.Config.LocalAddress.IsUnspecified())
+	configured.Transport.State.LocalAddress = netip.MustParseAddr("192.0.2.1")
+	peer.fsm.pConf.Update(&configured)
+	require.NoError(t, s.ListPeer(context.Background(), &api.ListPeerRequest{Address: peerAddress.String()}, func(listed *api.Peer) {
+		p = listed
+	}))
+	require.Equal(t, "192.0.2.1", p.GetTransport().GetLocalAddress())
+
+	// Update timer config using the complete Peer returned by ListPeer.
 	p.Timers.Config.HoldTime = 33
 	resp, err := s.UpdatePeer(context.Background(), &api.UpdatePeerRequest{Peer: p})
 	assert.NoError(t, err)
 	assert.False(t, resp.NeedsSoftResetIn)
+	assert.Same(t, peer, s.neighborMap[peerAddress])
+	assert.True(t, peer.fsm.pConf.ReadOnly().Transport.Config.LocalAddress.IsUnspecified())
 
 	assert.EventuallyWithT(t, func(collect *assert.CollectT) {
 		_ = s.ListPeer(context.Background(), &api.ListPeerRequest{}, func(peer *api.Peer) {

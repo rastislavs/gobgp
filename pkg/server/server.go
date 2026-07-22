@@ -3976,6 +3976,16 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 
 	peer.fsm.lock.Lock()
 	original := peer.fsm.pConf.ReadOnly()
+	// ListPeer reports the operational local address for a connected peer. The
+	// CLI sends that Peer back for partial updates, which would otherwise turn
+	// an implicitly selected source address (0.0.0.0 or ::) into an apparent
+	// configuration change and unnecessarily restart the session. Restore the
+	// configured wildcard before comparing the configurations.
+	if original.Transport.Config.LocalAddress.IsUnspecified() &&
+		original.Transport.State.LocalAddress.IsValid() &&
+		c.Transport.Config.LocalAddress == original.Transport.State.LocalAddress {
+		c.Transport.Config.LocalAddress = original.Transport.Config.LocalAddress
+	}
 	conf := peer.fsm.pConf.ReadCopy()
 	if !conf.ApplyPolicy.Equal(&c.ApplyPolicy) {
 		peer.fsm.logger.Info("Update ApplyPolicy")
