@@ -113,7 +113,9 @@ func newTcpAoKeychainKeys(chainName string, keys []*api.TcpAoKey) ([]netutils.TC
 		}
 		switch key.Algorithm {
 		case api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA1_96,
-			api.TcpAoAlgorithm_TCP_AO_ALGORITHM_AES_128_CMAC_96:
+			api.TcpAoAlgorithm_TCP_AO_ALGORITHM_AES_128_CMAC_96,
+			api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA256_96,
+			api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA256_128:
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, "TCP-AO keychain %q key %d has unsupported algorithm %s", chainName, i, key.Algorithm)
 		}

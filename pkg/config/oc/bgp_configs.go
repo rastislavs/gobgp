@@ -1075,18 +1075,24 @@ type KeychainRef string
 type CryptoType string
 
 const (
-	CRYPTO_TYPE_HMAC_SHA_1_96   CryptoType = "hmac_sha_1_96"
-	CRYPTO_TYPE_AES_128_CMAC_96 CryptoType = "aes_128_cmac_96"
+	CRYPTO_TYPE_HMAC_SHA_1_96    CryptoType = "hmac_sha_1_96"
+	CRYPTO_TYPE_AES_128_CMAC_96  CryptoType = "aes_128_cmac_96"
+	CRYPTO_TYPE_HMAC_SHA_256_96  CryptoType = "hmac_sha_256_96"
+	CRYPTO_TYPE_HMAC_SHA_256_128 CryptoType = "hmac_sha_256_128"
 )
 
 var CryptoTypeToIntMap = map[CryptoType]int{
-	CRYPTO_TYPE_HMAC_SHA_1_96:   0,
-	CRYPTO_TYPE_AES_128_CMAC_96: 1,
+	CRYPTO_TYPE_HMAC_SHA_1_96:    0,
+	CRYPTO_TYPE_AES_128_CMAC_96:  1,
+	CRYPTO_TYPE_HMAC_SHA_256_96:  2,
+	CRYPTO_TYPE_HMAC_SHA_256_128: 3,
 }
 
 var IntToCryptoTypeMap = map[int]CryptoType{
 	0: CRYPTO_TYPE_HMAC_SHA_1_96,
 	1: CRYPTO_TYPE_AES_128_CMAC_96,
+	2: CRYPTO_TYPE_HMAC_SHA_256_96,
+	3: CRYPTO_TYPE_HMAC_SHA_256_128,
 }
 
 func (v CryptoType) Validate() error {

@@ -1719,6 +1719,18 @@ module gobgp {
       "RFC 4494 - The AES-CMAC-96 Algorithm and Its Use with IPsec";
   }
 
+  identity HMAC_SHA_256_96 {
+    base CRYPTO_TYPE;
+    description
+      "HMAC-SHA-256 with a 96-bit MAC.";
+  }
+
+  identity HMAC_SHA_256_128 {
+    base CRYPTO_TYPE;
+    description
+      "HMAC-SHA-256 with a 128-bit MAC.";
+  }
+
   typedef hex-string-prefixed {
     type string {
       pattern '(0x)([0-9a-fA-F]{2})*';
