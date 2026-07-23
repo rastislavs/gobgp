@@ -204,7 +204,8 @@ func validateTCPAOAddKeys(keys []TCPAOKey) error {
 			return fmt.Errorf("TCP-AO key with SendID %d must contain 1-%d master-key bytes", key.SendID, tcpAOMaxKeyLen)
 		}
 		switch key.Algorithm {
-		case TCPAOAlgorithmHMACSHA1, TCPAOAlgorithmAES128CMAC:
+		case TCPAOAlgorithmHMACSHA1, TCPAOAlgorithmAES128CMAC,
+			TCPAOAlgorithmHMACSHA256MAC96, TCPAOAlgorithmHMACSHA256MAC128:
 		default:
 			return fmt.Errorf("unsupported TCP-AO algorithm for SendID %d", key.SendID)
 		}
