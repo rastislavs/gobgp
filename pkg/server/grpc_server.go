@@ -988,6 +988,19 @@ func newBfdConfigFromAPIStruct(a *api.BfdPeerConfig) (oc.BfdConfig, error) {
 	}, nil
 }
 
+func tcpAoConfigFromAPI(a *api.TcpAoPeerConfig) (oc.TcpAoConfig, error) {
+	if a == nil {
+		return oc.TcpAoConfig{}, nil
+	}
+	if a.PreferredSendId > 255 {
+		return oc.TcpAoConfig{}, status.Errorf(codes.InvalidArgument, "TCP-AO preferred send ID %d is outside 0..255", a.PreferredSendId)
+	}
+	return oc.TcpAoConfig{
+		Keychain:        oc.KeychainRef(a.Keychain),
+		PreferredSendId: uint8(a.PreferredSendId),
+	}, nil
+}
+
 func newNeighborFromAPIStruct(a *api.Peer) (*oc.Neighbor, error) {
 	pconf := &oc.Neighbor{}
 	if a.Conf != nil {
@@ -1099,6 +1112,11 @@ func newNeighborFromAPIStruct(a *api.Peer) (*oc.Neighbor, error) {
 		pconf.Transport.Config.TcpMss = uint16(a.Transport.TcpMss)
 		pconf.Transport.Config.IpTos = uint8(a.Transport.IpTos)
 	}
+	tcpAo, err := tcpAoConfigFromAPI(a.TcpAo)
+	if err != nil {
+		return nil, err
+	}
+	pconf.TcpAo.Config = tcpAo
 	if a.EbgpMultihop != nil {
 		pconf.EbgpMultihop.Config.Enabled = a.EbgpMultihop.Enabled
 		pconf.EbgpMultihop.Config.MultihopTtl = uint8(a.EbgpMultihop.MultihopTtl)
@@ -1254,6 +1272,11 @@ func newPeerGroupFromAPIStruct(a *api.PeerGroup) (*oc.PeerGroup, error) {
 		pconf.Transport.Config.TcpMss = uint16(a.Transport.TcpMss)
 		pconf.Transport.Config.IpTos = uint8(a.Transport.IpTos)
 	}
+	tcpAo, err := tcpAoConfigFromAPI(a.TcpAo)
+	if err != nil {
+		return nil, err
+	}
+	pconf.TcpAo.Config = tcpAo
 	if a.EbgpMultihop != nil {
 		pconf.EbgpMultihop.Config.Enabled = a.EbgpMultihop.Enabled
 		pconf.EbgpMultihop.Config.MultihopTtl = uint8(a.EbgpMultihop.MultihopTtl)
