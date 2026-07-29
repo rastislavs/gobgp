@@ -341,6 +341,22 @@ func (s *BgpServer) passConnToPeer(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		tcpAoKeys, err := peer.fsm.tcpAoKeyBinding.Load().socketKeys()
+		if err != nil {
+			peer.fsm.logger.Warn("could not load TCP-AO keychain", slog.String("Error", err.Error()))
+			conn.Close()
+			return
+		}
+		if tcpAoKeys != nil {
+			err = setTcpAoConnectionPreferredKey(conn, tcpAoKeys)
+			if err != nil {
+				tcpAoKeys.clear()
+				peer.fsm.logger.Warn("could not configure TCP-AO for the connection", slog.String("Error", err.Error()))
+				conn.Close()
+				return
+			}
+		}
+		tcpAoKeys.clear()
 
 		peer.fsm.logger.Debug("Accepted a new passive connection")
 		peer.PassConn(conn)
@@ -3420,6 +3436,18 @@ func (s *BgpServer) ListPeer(ctx context.Context, r *api.ListPeerRequest, fn fun
 			}
 			// FIXME: should remove toConfig() conversion
 			p := oc.NewPeerFromConfigStruct(s.toConfig(peer, getAdvertised))
+			if peer.fsm.tcpAoKeyBinding.Load() != nil {
+				peer.fsm.lock.Lock()
+				if peer.fsm.conn != nil {
+					state, err := getTcpAoConnectionState(peer.fsm.conn)
+					if err != nil {
+						peer.fsm.logger.Debug("failed to get TCP-AO socket state", slog.String("Err", err.Error()))
+					} else {
+						p.State.TcpAoState = state
+					}
+				}
+				peer.fsm.lock.Unlock()
+			}
 			for _, family := range peer.configuredRFlist() {
 				for i, afisafi := range p.AfiSafis {
 					if !afisafi.Config.Enabled {
@@ -3509,8 +3537,11 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 	if err != nil {
 		return err
 	}
-
-	if _, y := s.neighborMap[netip.MustParseAddr(addr)]; y {
+	ipAddr, err := netip.ParseAddr(addr)
+	if err != nil {
+		return fmt.Errorf("failed to parse IP address: %v", err)
+	}
+	if _, y := s.neighborMap[ipAddr]; y {
 		return fmt.Errorf("can't overwrite the existing peer: %s", addr)
 	}
 
@@ -3534,15 +3565,34 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		return fmt.Errorf("can't be both route-server-client and route-reflector-client")
 	}
 
+	keyBinding, err := s.getTcpAoKeyBinding(&c.TcpAo.Config)
+	if err != nil {
+		return err
+	}
+	if keyBinding != nil && c.Config.AuthPassword != "" {
+		return status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+	}
+	tcpAoKeys, err := keyBinding.socketKeys()
+	if err != nil {
+		return err
+	}
+	defer tcpAoKeys.clear()
+	var listeners []*net.TCPListener
 	if s.bgpConfig.Global.Config.Port > 0 {
-		for _, l := range s.listListeners(addr) {
-			if c.Config.AuthPassword != "" {
-				if err := netutils.SetTCPMD5SigSockopt(l, c.Transport.Config.BindInterface, addr, c.Config.AuthPassword); err != nil {
-					s.logger.Warn("failed to set md5",
-						slog.String("Topic", "Peer"),
-						slog.String("Key", addr),
-						slog.String("Err", err.Error()))
-				}
+		listeners = s.listListeners(addr)
+	}
+	if tcpAoKeys != nil {
+		if err := addTcpAoKeysToListeners(listeners, ipAddr, s.tcpAoBindInterface(c.Transport.Config), tcpAoKeys); err != nil {
+			return fmt.Errorf("failed to configure TCP-AO listener for peer %s: %w", addr, err)
+		}
+	}
+	for _, l := range listeners {
+		if c.Config.AuthPassword != "" {
+			if err := netutils.SetTCPMD5SigSockopt(l, c.Transport.Config.BindInterface, addr, c.Config.AuthPassword); err != nil {
+				s.logger.Warn("failed to set md5",
+					slog.String("Topic", "Peer"),
+					slog.String("Key", addr),
+					slog.String("Err", err.Error()))
 			}
 		}
 	}
@@ -3555,18 +3605,15 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		rib = s.rsRib
 	}
 	peer := newPeer(&s.bgpConfig.Global, c, bgp.BGP_FSM_IDLE, rib, s.policy, s.logger)
+	peer.fsm.tcpAoKeyBinding.Store(keyBinding)
 	if err := s.policy.SetPeerPolicy(peer.ID(), c.ApplyPolicy); err != nil {
 		return fmt.Errorf("failed to set peer policy for %s: %v", addr, err)
 	}
-	s.neighborMap[netip.MustParseAddr(addr)] = peer
+	s.neighborMap[ipAddr] = peer
 	if name := c.Config.PeerGroup; name != "" {
 		s.peerGroupMap[name].AddMember(*c)
 	}
 	if s.bfdServer != nil {
-		ipAddr, err := netip.ParseAddr(addr)
-		if err != nil {
-			return fmt.Errorf("failed to parse IP address: %v", err)
-		}
 		if err := s.bfdServer.AddPeer(context.Background(), ipAddr, c.Bfd.Config, c.Transport.Config.BindInterface); err != nil {
 			s.logger.Warn("failed to add BFD peer",
 				slog.String("Topic", "Peer"),
@@ -3576,6 +3623,22 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 	}
 	s.startFsmHandler(peer)
 	return nil
+}
+
+func (s *BgpServer) getTcpAoKeyBinding(config *oc.TcpAoConfig) (*tcpAoKeyBinding, error) {
+	if config == nil || config.Keychain == "" {
+		return nil, nil
+	}
+	name := string(config.Keychain)
+	keychain, ok := s.keyChainStore.getKeychain(name)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "TCP-AO keychain %q does not exist", name)
+	}
+	preferred := config.PreferredSendId
+	if !keychain.hasSendID(preferred) {
+		return nil, status.Errorf(codes.NotFound, "TCP-AO keychain %q has no key with send ID %d", name, preferred)
+	}
+	return &tcpAoKeyBinding{keychain: keychain, preferredSendID: preferred}, nil
 }
 
 func apiBfdSessionStateToOC(state api.BfdSessionState) oc.BfdSessionState {
@@ -3671,6 +3734,9 @@ func (s *BgpServer) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNei
 		if !ok {
 			return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
 		}
+		if pg.Conf.TcpAo.Config.Keychain != "" {
+			return status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are not supported")
+		}
 		pg.AddDynamicNeighbor(c)
 
 		pConf := pg.Conf
@@ -3709,13 +3775,6 @@ func (s *BgpServer) deletePeerGroup(name string) error {
 }
 
 func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNotification bool) error {
-	if c.Config.PeerGroup != "" {
-		_, y := s.peerGroupMap[c.Config.PeerGroup]
-		if y {
-			s.peerGroupMap[c.Config.PeerGroup].DeleteMember(*c)
-		}
-	}
-
 	addr, err := c.ExtractNeighborAddress()
 	if err != nil {
 		return err
@@ -3728,15 +3787,38 @@ func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNoti
 			return err
 		}
 	}
-	n, y := s.neighborMap[netip.MustParseAddr(addr)]
+	ipAddr, err := netip.ParseAddr(addr)
+	if err != nil {
+		return fmt.Errorf("failed to parse IP address: %v", err)
+	}
+	n, y := s.neighborMap[ipAddr]
 	if !y {
 		return fmt.Errorf("can't delete a peer configuration for %s", addr)
 	}
-	for _, l := range s.listListeners(addr) {
-		if c.Config.AuthPassword != "" {
-			if err := netutils.SetTCPMD5SigSockopt(l, c.Transport.Config.BindInterface, addr, ""); err != nil {
+
+	configured := n.fsm.pConf.ReadOnly()
+	keyBinding := n.fsm.tcpAoKeyBinding.Load()
+	tcpAoKeys, err := keyBinding.socketKeys()
+	if err != nil {
+		return err
+	}
+	defer tcpAoKeys.clear()
+	listeners := s.listListeners(addr)
+	if tcpAoKeys != nil {
+		for _, err := range deleteTcpAoKeysFromListeners(listeners, ipAddr, s.tcpAoBindInterface(configured.Transport.Config), tcpAoKeys) {
+			n.fsm.logger.Warn("failed to unset TCP-AO", slog.String("Err", err.Error()))
+		}
+	}
+	for _, l := range listeners {
+		if configured.Config.AuthPassword != "" {
+			if err := netutils.SetTCPMD5SigSockopt(l, configured.Transport.Config.BindInterface, addr, ""); err != nil {
 				n.fsm.logger.Warn("failed to unset md5", slog.String("Err", err.Error()))
 			}
+		}
+	}
+	if configured.Config.PeerGroup != "" {
+		if group, ok := s.peerGroupMap[configured.Config.PeerGroup]; ok {
+			group.DeleteMember(*configured)
 		}
 	}
 	n.fsm.logger.Info("Delete a peer configuration")
@@ -3945,6 +4027,27 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 	if !original.Timers.Config.Equal(&c.Timers.Config) {
 		peer.fsm.logger.Info("Update timer configuration")
 		conf.Timers.Config = c.Timers.Config
+	}
+
+	if !original.TcpAo.Config.Equal(&c.TcpAo.Config) {
+		keyBinding, err := s.getTcpAoKeyBinding(&c.TcpAo.Config)
+		if err != nil {
+			peer.fsm.lock.Unlock()
+			return needsSoftResetIn, err
+		}
+		if peer.fsm.conn != nil {
+			tcpAoKeys, err := keyBinding.socketKeys()
+			if err == nil {
+				err = setTcpAoConnectionRNext(peer.fsm.conn, tcpAoKeys)
+				tcpAoKeys.clear()
+			}
+			if err != nil {
+				peer.fsm.lock.Unlock()
+				return needsSoftResetIn, fmt.Errorf("failed changing the TCP-AO key for peer %s: %w", addr, err)
+			}
+		}
+		peer.fsm.tcpAoKeyBinding.Store(keyBinding)
+		conf.TcpAo = c.TcpAo
 	}
 
 	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
@@ -5419,6 +5522,7 @@ func (s *BgpServer) UpdateTcpAoKeychain(_ context.Context, r *api.UpdateTcpAoKey
 			return err
 		}
 		keychain.updateKeys(toAdd, toDelete)
+		s.updateTcpAoKeychainSockets(r.Name, toAdd, toDelete)
 		response = &api.UpdateTcpAoKeychainResponse{Keychain: keychain.toAPIKeychain()}
 		return nil
 	}, false)
@@ -5437,6 +5541,9 @@ func (s *BgpServer) DeleteTcpAoKeychain(_ context.Context, r *api.DeleteTcpAoKey
 	}
 
 	return s.mgmtOperation(func() error {
+		if s.tcpAoKeychainUsed(r.Name) {
+			return status.Errorf(codes.FailedPrecondition, "TCP-AO keychain %q is in use", r.Name)
+		}
 		if !s.keyChainStore.deleteKeychain(r.Name) {
 			return status.Errorf(codes.NotFound, "TCP-AO keychain %q does not exist", r.Name)
 		}
@@ -5512,6 +5619,10 @@ func (s *BgpServer) prepareTcpAoKeychainUpdate(keychain *tcpAoKeychain, request 
 			err = status.Errorf(codes.NotFound, "TCP-AO keychain %q does not contain key with send ID %d", request.Name, delKey.SendId)
 			return
 		}
+		if s.tcpAoKeyUsed(request.Name, delKey.SendId) {
+			err = status.Errorf(codes.FailedPrecondition, "TCP-AO keychain %q key with send ID %d and receive ID %d is in use", request.Name, delKey.SendId, delKey.ReceiveId)
+			return
+		}
 		delete(sendIDs, key.SendID)
 		delete(receiveIDs, key.ReceiveID)
 		// add to the list of keys to delete
@@ -5553,4 +5664,131 @@ func (s *BgpServer) prepareTcpAoKeychainUpdate(keychain *tcpAoKeychain, request 
 		toAdd, err = newTcpAoKeychainKeys(keychain.name, request.AddKeys)
 	}
 	return
+}
+
+func (s *BgpServer) tcpAoKeychainUsed(name string) bool {
+	for _, group := range s.peerGroupMap {
+		config := &group.Conf.TcpAo.Config
+		if config.Keychain != "" && string(config.Keychain) == name {
+			return true
+		}
+	}
+	for _, peer := range s.neighborMap {
+		config := &peer.fsm.pConf.ReadOnly().TcpAo.Config
+		if config.Keychain != "" && string(config.Keychain) == name {
+			return true
+		}
+		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
+		if keyBinding != nil && keyBinding.keychain.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *BgpServer) tcpAoKeyUsed(keychainName string, sendID uint32) bool {
+	for _, group := range s.peerGroupMap {
+		keyBinding, err := s.getTcpAoKeyBinding(&group.Conf.TcpAo.Config)
+		if err == nil && keyBinding != nil && keyBinding.keychain.name == keychainName && uint32(keyBinding.preferredSendID) == sendID {
+			return true
+		}
+	}
+	for _, peer := range s.neighborMap {
+		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
+		if keyBinding == nil || keyBinding.keychain.name != keychainName {
+			continue
+		}
+		if uint32(keyBinding.preferredSendID) == sendID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *BgpServer) updateTcpAoKeychainSockets(name string, added, deleted []netutils.TCPAOKey) {
+	if len(added) == 0 && len(deleted) == 0 {
+		return
+	}
+	addedKeys := newTcpAoSocketKeys(added, nil)
+	deletedKeys := newTcpAoSocketKeys(deleted, nil)
+	defer addedKeys.clear()
+	defer deletedKeys.clear()
+
+	logError := func(peer *peer, target string, err error) {
+		peer.fsm.logger.Warn("failed to update TCP-AO keys",
+			slog.String("Target", target),
+			slog.String("Error", err.Error()))
+	}
+	for _, peer := range s.neighborMap {
+		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
+		if keyBinding == nil || keyBinding.keychain.name != name {
+			continue
+		}
+		conf := peer.fsm.pConf.ReadOnly()
+		addr, err := conf.ExtractNeighborAddress()
+		if err != nil {
+			logError(peer, "peer", err)
+			continue
+		}
+		peerAddr, err := netip.ParseAddr(addr)
+		if err != nil {
+			logError(peer, "peer", err)
+			continue
+		}
+		interfaceName := s.tcpAoBindInterface(conf.Transport.Config)
+		for _, listener := range s.listListeners(addr) {
+			raw, err := listener.SyscallConn()
+			if err != nil {
+				if len(deleted) != 0 {
+					logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
+				}
+				if len(added) != 0 {
+					logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
+				}
+				continue
+			}
+			if len(deleted) != 0 {
+				if err := deleteTcpAoKeys(raw, peerAddr, interfaceName, deletedKeys); err != nil {
+					logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
+				}
+			}
+			if len(added) != 0 {
+				if err := addTcpAoKeys(raw, peerAddr, interfaceName, addedKeys, false); err != nil {
+					logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
+				}
+			}
+		}
+		peer.fsm.lock.Lock()
+		if peer.fsm.conn != nil {
+			raw, err := tcpAoRawConn(peer.fsm.conn)
+			if err != nil {
+				if len(deleted) != 0 {
+					logError(peer, "connection", fmt.Errorf("delete TCP-AO keys: %w", err))
+				}
+				if len(added) != 0 {
+					logError(peer, "connection", fmt.Errorf("add TCP-AO keys: %w", err))
+				}
+				peer.fsm.lock.Unlock()
+				continue
+			}
+			if len(deleted) != 0 {
+				if err := deleteTcpAoKeys(raw, peerAddr, interfaceName, deletedKeys); err != nil {
+					logError(peer, "connection", fmt.Errorf("delete TCP-AO keys: %w", err))
+				}
+			}
+			if len(added) != 0 {
+				if err := addTcpAoKeys(raw, peerAddr, interfaceName, addedKeys, false); err != nil {
+					logError(peer, "connection", fmt.Errorf("add TCP-AO keys: %w", err))
+				}
+			}
+		}
+		peer.fsm.lock.Unlock()
+	}
+}
+
+func (s *BgpServer) tcpAoBindInterface(peerConfig oc.TransportConfig) string {
+	if peerConfig.BindInterface != "" {
+		return peerConfig.BindInterface
+	}
+	return s.bgpConfig.Global.Config.BindToDevice
 }

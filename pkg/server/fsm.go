@@ -397,6 +397,21 @@ func (p *pConfAccess) Update(conf *oc.Neighbor) {
 	p.conf.Store(conf)
 }
 
+// tcpAoKeyBinding is the per-peer attachment to a shared TCP-AO keychain.
+// Keychain updates mutate the shared object under its lock rather than replacing it,
+// and management operations reject deletion while a configured peer or FSM still references it.
+type tcpAoKeyBinding struct {
+	keychain        *tcpAoKeychain
+	preferredSendID uint8
+}
+
+func (b *tcpAoKeyBinding) socketKeys() (*tcpAoSocketKeys, error) {
+	if b == nil {
+		return nil, nil
+	}
+	return b.keychain.socketKeys(b.preferredSendID)
+}
+
 type fsm struct {
 	counterStats oc.Messages
 	timerStats   oc.Timers
@@ -429,6 +444,7 @@ type fsm struct {
 	adminState               adminStateRaw
 	adminStateCh             chan adminStateOperation
 	outgoingConnCh           chan outgoingConn
+	tcpAoKeyBinding          atomic.Pointer[tcpAoKeyBinding]
 
 	// only loop goroutine accesses; no lock required
 	outgoingConnMgr   *outgoingConnManager
@@ -891,7 +907,7 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 	fsm := h.fsm
 
-	retryInterval, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface, tos := func() (int, string, int, string, uint8, uint8, uint16, string, int, string, uint8) {
+	retryInterval, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface, tos := func() (int, netip.Addr, int, string, uint8, uint8, uint16, string, int, string, uint8) {
 		conf := fsm.pConf.ReadOnly()
 		tick := max(int(conf.Timers.Config.ConnectRetry), minConnectRetryInterval)
 
@@ -917,7 +933,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 				ttl = conf.EbgpMultihop.Config.MultihopTtl
 			}
 		}
-		return tick, addr.String(), port, password, ttl, ttlMin, conf.Transport.Config.TcpMss, conf.Transport.Config.LocalAddress.String(), int(conf.Transport.Config.LocalPort), conf.Transport.Config.BindInterface, tos
+		return tick, addr, port, password, ttl, ttlMin, conf.Transport.Config.TcpMss, conf.Transport.Config.LocalAddress.String(), int(conf.Transport.Config.LocalPort), conf.Transport.Config.BindInterface, tos
 	}()
 
 	tick := minConnectRetryInterval
@@ -943,11 +959,27 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 				Timeout:   time.Duration(max(retryInterval-1, minConnectRetryInterval)) * time.Second,
 				KeepAlive: -1,
 				Control: func(network, address string, c syscall.RawConn) error {
-					return netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos)
+					if err := netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos); err != nil {
+						return err
+					}
+					if keyBinding := fsm.tcpAoKeyBinding.Load(); keyBinding != nil {
+						tcpAoKeys, err := keyBinding.socketKeys()
+						if err != nil {
+							return fmt.Errorf("failed to load TCP-AO keychain for peer %s: %w", addr, err)
+						}
+						defer tcpAoKeys.clear()
+						if err := addTcpAoKeys(c, addr, bindInterface, tcpAoKeys, true); err != nil {
+							return fmt.Errorf("failed to configure TCP-AO for peer %s: %w", addr, err)
+						}
+					}
+					return nil
 				},
 			}
+			if fsm.tcpAoKeyBinding.Load() != nil {
+				d.SetMultipathTCP(false) // multipath is not supported with TCP-AO
+			}
 
-			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr, strconv.Itoa(port)))
+			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), strconv.Itoa(port)))
 			select {
 			case <-ctx.Done():
 				fsm.logger.Debug("stop connect loop")
