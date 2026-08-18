@@ -362,6 +362,16 @@ func TestTcpAoPeerOperations(t *testing.T) {
 	require.NotNil(t, keyBinding)
 	assert.Equal(t, "primary", keyBinding.keychain.name)
 	assert.Equal(t, uint8(1), keyBinding.preferredSendID)
+	initialKeys, err := keyBinding.socketKeys()
+	require.NoError(t, err)
+	conn, connPeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = connPeer.Close()
+	})
+	tcpAoConn := &tcpAoConnection{Conn: conn, keyBinding: keyBinding, keychainRevision: initialKeys.keychainRevision}
+	initialKeys.clear()
+	assert.True(t, tcpAoConnectionCurrent(tcpAoConn, keyBinding))
 
 	// ListPeer exposes the effective TCP-AO configuration.
 	var listed *api.Peer
@@ -419,6 +429,7 @@ func TestTcpAoPeerOperations(t *testing.T) {
 		AddKeys: []*api.TcpAoKey{{SendId: 5, ReceiveId: 6, Algorithm: api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA1_96, MasterKey: []byte("new")}},
 	})
 	require.NoError(t, err)
+	assert.False(t, tcpAoConnectionCurrent(tcpAoConn, keyBinding))
 	peerKeys, err := peer.fsm.tcpAoKeyBinding.Load().socketKeys()
 	require.NoError(t, err)
 	require.Len(t, peerKeys.keys, 2)

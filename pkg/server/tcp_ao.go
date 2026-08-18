@@ -34,9 +34,10 @@ import (
 const tcpAoMaxMasterKeyBytes = 80
 
 type tcpAoKeychain struct {
-	mu   sync.RWMutex // used to protect concurrent access of management operations and socket operations
-	name string
-	keys map[uint8]netutils.TCPAOKey
+	mu       sync.RWMutex // used to protect concurrent access of management operations and socket operations
+	name     string
+	keys     map[uint8]netutils.TCPAOKey
+	revision uint64
 }
 
 type tcpAoKeychainStore struct {
@@ -200,6 +201,9 @@ func (c *tcpAoKeychain) updateKeys(added, deleted []netutils.TCPAOKey) {
 	for _, key := range added {
 		c.keys[key.SendID] = key
 	}
+	if len(added) != 0 || len(deleted) != 0 {
+		c.revision++
+	}
 }
 
 func (c *tcpAoKeychain) clearKeys() {
@@ -223,7 +227,16 @@ func (c *tcpAoKeychain) socketKeys(preferredSendID uint8) (*tcpAoSocketKeys, err
 		return nil, status.Errorf(codes.NotFound, "TCP-AO keychain %q has no key with send ID %d", c.name, preferredSendID)
 	}
 	keys := slices.Collect(maps.Values(c.keys))
-	return newTcpAoSocketKeys(keys, &preferredSendID), nil
+	socketKeys := newTcpAoSocketKeys(keys, &preferredSendID)
+	socketKeys.keychainRevision = c.revision
+	return socketKeys, nil
+}
+
+func (c *tcpAoKeychain) getRevision() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.revision
 }
 
 // tcpAoSocketKeys is a short-lived TCP-AO key snapshot used for socket operations.
@@ -233,8 +246,9 @@ func (c *tcpAoKeychain) socketKeys(preferredSendID uint8) (*tcpAoSocketKeys, err
 // The preferred send ID is optional: listeners and key deletion only need the keys;
 // active and accepted connections also select a send ID.
 type tcpAoSocketKeys struct {
-	keys            []netutils.TCPAOKey
-	preferredSendID *uint8
+	keys             []netutils.TCPAOKey
+	preferredSendID  *uint8
+	keychainRevision uint64
 }
 
 func newTcpAoSocketKeys(keys []netutils.TCPAOKey, preferredSendID *uint8) *tcpAoSocketKeys {
@@ -260,6 +274,55 @@ func (k *tcpAoSocketKeys) clear() {
 	}
 	k.keys = nil
 	k.preferredSendID = nil
+}
+
+type tcpAoConnection struct {
+	net.Conn
+	keyBinding       *tcpAoKeyBinding
+	keychainRevision uint64
+}
+
+func (c *tcpAoConnection) SyscallConn() (syscall.RawConn, error) {
+	syscallConn, ok := c.Conn.(syscall.Conn)
+	if !ok {
+		return nil, fmt.Errorf("TCP connection does not expose a syscall connection")
+	}
+	return syscallConn.SyscallConn()
+}
+
+func tcpAoConnectionCurrent(conn net.Conn, current *tcpAoKeyBinding) bool {
+	tcpAoConn, ok := conn.(*tcpAoConnection)
+	if !ok {
+		return true
+	}
+	if tcpAoConn.keyBinding != current {
+		return false
+	}
+	return current == nil || tcpAoConn.keychainRevision == current.keychain.getRevision()
+}
+
+func tcpAoConnectionKeysMatch(conn net.Conn, socketKeys *tcpAoSocketKeys) (bool, error) {
+	raw, err := tcpAoRawConn(conn)
+	if err != nil {
+		return false, err
+	}
+	states, err := netutils.GetTCPAOKeyStateSockopt(raw)
+	if err != nil {
+		return false, err
+	}
+	if len(states) != len(socketKeys.keys) {
+		return false, nil
+	}
+	keys := make(map[[2]uint8]struct{}, len(socketKeys.keys))
+	for _, key := range socketKeys.keys {
+		keys[[2]uint8{key.SendID, key.ReceiveID}] = struct{}{}
+	}
+	for _, state := range states {
+		if _, ok := keys[[2]uint8{state.SendID, state.ReceiveID}]; !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (k *tcpAoSocketKeys) netutilsConfig(selectPreferred bool) (netutils.TCPAOConfig, error) {

@@ -341,22 +341,38 @@ func (s *BgpServer) passConnToPeer(conn net.Conn) {
 			conn.Close()
 			return
 		}
-		tcpAoKeys, err := peer.fsm.tcpAoKeyBinding.Load().socketKeys()
+		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
+		tcpAoKeys, err := keyBinding.socketKeys()
 		if err != nil {
 			peer.fsm.logger.Warn("could not load TCP-AO keychain", slog.String("Error", err.Error()))
 			conn.Close()
 			return
 		}
+		defer tcpAoKeys.clear()
 		if tcpAoKeys != nil {
+			matches, err := tcpAoConnectionKeysMatch(conn, tcpAoKeys)
+			if err != nil {
+				peer.fsm.logger.Warn("could not read TCP-AO keys from the connection", slog.String("Error", err.Error()))
+				conn.Close()
+				return
+			}
+			if !matches {
+				peer.fsm.logger.Warn("accepted TCP-AO connection has stale keys")
+				conn.Close()
+				return
+			}
 			err = setTcpAoConnectionPreferredKey(conn, tcpAoKeys)
 			if err != nil {
-				tcpAoKeys.clear()
 				peer.fsm.logger.Warn("could not configure TCP-AO for the connection", slog.String("Error", err.Error()))
 				conn.Close()
 				return
 			}
 		}
-		tcpAoKeys.clear()
+		tcpAoKeychainRevision := uint64(0)
+		if tcpAoKeys != nil {
+			tcpAoKeychainRevision = tcpAoKeys.keychainRevision
+		}
+		conn = &tcpAoConnection{Conn: conn, keyBinding: keyBinding, keychainRevision: tcpAoKeychainRevision}
 
 		peer.fsm.logger.Debug("Accepted a new passive connection")
 		peer.PassConn(conn)

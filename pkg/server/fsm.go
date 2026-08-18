@@ -67,6 +67,7 @@ const (
 	fsmHardReset
 	fsmDeConfigured
 	fsmBadPeerAS
+	fsmTcpAoKeychainChanged
 )
 
 type fsmStateReason struct {
@@ -119,6 +120,8 @@ func (r fsmStateReason) String() string {
 		return "hard-reset"
 	case fsmBadPeerAS:
 		return "bad-peer-as"
+	case fsmTcpAoKeychainChanged:
+		return "tcp-ao-keychain-changed"
 	default:
 		return "unknown"
 	}
@@ -954,6 +957,8 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 		}
 
 		if err == nil {
+			var keyBinding *tcpAoKeyBinding
+			var tcpAoKeychainRevision uint64
 			d := net.Dialer{
 				LocalAddr: laddr,
 				Timeout:   time.Duration(max(retryInterval-1, minConnectRetryInterval)) * time.Second,
@@ -962,12 +967,14 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 					if err := netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos); err != nil {
 						return err
 					}
-					if keyBinding := fsm.tcpAoKeyBinding.Load(); keyBinding != nil {
+					keyBinding = fsm.tcpAoKeyBinding.Load()
+					if keyBinding != nil {
 						tcpAoKeys, err := keyBinding.socketKeys()
 						if err != nil {
 							return fmt.Errorf("failed to load TCP-AO keychain for peer %s: %w", addr, err)
 						}
 						defer tcpAoKeys.clear()
+						tcpAoKeychainRevision = tcpAoKeys.keychainRevision
 						if err := addTcpAoKeys(c, addr, bindInterface, tcpAoKeys, true); err != nil {
 							return fmt.Errorf("failed to configure TCP-AO for peer %s: %w", addr, err)
 						}
@@ -980,6 +987,9 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 			}
 
 			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), strconv.Itoa(port)))
+			if err == nil {
+				conn = &tcpAoConnection{Conn: conn, keyBinding: keyBinding, keychainRevision: tcpAoKeychainRevision}
+			}
 			select {
 			case <-ctx.Done():
 				fsm.logger.Debug("stop connect loop")
@@ -1018,6 +1028,12 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 			}
 
 			fsm.lock.Lock()
+			if !tcpAoConnectionCurrent(conn, fsm.tcpAoKeyBinding.Load()) {
+				fsm.lock.Unlock()
+				conn.Close()
+				fsm.logger.Warn("accepted connection closed after TCP-AO keychain changed")
+				continue
+			}
 			fsm.conn = conn
 			initializeConn(fsm, conn)
 			// we don't implement delayed open timer so move to opensent right
@@ -1044,12 +1060,19 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 				// the manager was stopped, restart it
 				fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm)
 			} else {
-				fsm.bgpMessageStateUpdate(bgp.BGP_MSG_KEEPALIVE, false)
 				fsm.lock.Lock()
+				if !tcpAoConnectionCurrent(result.conn, fsm.tcpAoKeyBinding.Load()) {
+					fsm.lock.Unlock()
+					result.conn.Close()
+					fsm.logger.Warn("outgoing connection closed after TCP-AO keychain changed")
+					fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm)
+					continue
+				}
 				fsm.conn = result.conn
 				fsm.recvOpen = result.open
 				fsm.lock.Unlock()
 
+				fsm.bgpMessageStateUpdate(bgp.BGP_MSG_KEEPALIVE, false)
 				return bgp.BGP_FSM_OPENCONFIRM, newfsmStateReason(fsmOpenMsgReceived, result.open, nil)
 			}
 		case <-fsm.gracefulRestartTimer.C:
@@ -1587,6 +1610,13 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 				}
 			}
 
+			fsm.lock.Lock()
+			currentTcpAoKeys := tcpAoConnectionCurrent(fsm.conn, fsm.tcpAoKeyBinding.Load())
+			fsm.lock.Unlock()
+			if !currentTcpAoKeys {
+				fsm.conn.Close()
+				return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmTcpAoKeychainChanged, nil, nil)
+			}
 			b, _ := bgp.NewBGPKeepAliveMessage().Serialize()
 			fsm.conn.SetWriteDeadline(time.Now().Add(time.Second))
 			if _, err := fsm.conn.Write(b); err != nil {
@@ -1631,6 +1661,13 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 						fsm.lock.Unlock()
 					}
 				}
+			}
+			fsm.lock.Lock()
+			currentTcpAoKeys := tcpAoConnectionCurrent(fsm.conn, fsm.tcpAoKeyBinding.Load())
+			fsm.lock.Unlock()
+			if !currentTcpAoKeys {
+				fsm.conn.Close()
+				return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmTcpAoKeychainChanged, nil, nil)
 			}
 			b, _ := bgp.NewBGPKeepAliveMessage().Serialize()
 			fsm.conn.SetWriteDeadline(time.Now().Add(time.Second))
