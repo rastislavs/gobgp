@@ -70,6 +70,10 @@ PIDS=("${PIDS[@]}" $!)
 python3 $TESTDIR/tcp_md5_test.py --gobgp-image $GOBGP_IMAGE --test-prefix md5 -s -x --with-xunit --xunit-file=${WS}/nosetest_rs_md5.xml &
 PIDS=("${PIDS[@]}" $!)
 
+# tcp ao test
+python3 $TESTDIR/tcp_ao_test.py --gobgp-image $GOBGP_IMAGE --test-prefix ao -s -x --with-xunit --xunit-file=${WS}/nosetest_rs_ao.xml &
+PIDS=("${PIDS[@]}" $!)
+
 for (( i = 0; i < ${#PIDS[@]}; ++i ))
 do
     wait ${PIDS[$i]}
