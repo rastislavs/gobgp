@@ -16,6 +16,7 @@
 import base64
 import collections
 import ipaddress
+import json
 import sys
 import time
 import unittest
@@ -38,6 +39,7 @@ INITIAL_SECRET = b'tcp-ao-scenario-initial'
 ROTATION_SECRET = b'tcp-ao-scenario-rotation'
 NETSHOOT_IMAGE = 'nicolaka/netshoot:v0.15'
 VRF_BIND_INTERFACE = 'vrf-ao'
+DYNAMIC_NEIGHBOR_PREFIX = '172.17.0.0/16'
 TCP_AO_TIMERS = {
     'connect-retry': 1,
     'hold-time': 9,
@@ -95,7 +97,12 @@ def _tcp_ao_config(name, preferred_send_id):
 
 
 def _tcp_ao_keys(ctn, peer):
-    state = ctn.get_neighbor(peer)['state']['tcp_ao_state']
+    if isinstance(peer, str):
+        neighbor = json.loads(ctn.local(
+            'gobgp -j neighbor {0}'.format(peer), capture=True))
+    else:
+        neighbor = ctn.get_neighbor(peer)
+    state = neighbor['state']['tcp_ao_state']
     return {key['send_id']: key for key in state['keys']}
 
 
@@ -114,6 +121,22 @@ def _reload_tcp_ao_config(ctn, peer, name, keys, preferred_send_id):
     ctn.peers[peer]['tcp_ao']['preferred-send-id'] = preferred_send_id
     ctn.create_config()
     ctn.reload_config()
+
+
+def _reload_keychain(ctn, name, keys):
+    ctn.bgp_config['keychains'] = [_keychain(name, keys)]
+    ctn.create_config()
+    ctn.reload_config()
+
+
+def _wait_dynamic_established(ctn, peer_addr):
+    def f():
+        peer = json.loads(ctn.local(
+            'gobgp -j neighbor {0}'.format(peer_addr), capture=True))
+        if peer['state']['session_state'] != 6:
+            raise AssertionError
+
+    assert_several_times(f, t=120, s=1)
 
 
 class GoBGPTCPAOTest(unittest.TestCase):
@@ -214,6 +237,100 @@ class GoBGPTCPAOTest(unittest.TestCase):
             ('hmac_sha_256_128', 13, 23),
         ]:
             self._rotate(algorithm, g1_id, g2_id)
+
+
+class GoBGPTCPAODynamicNeighborTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        base.TEST_PREFIX = parser_option.test_prefix
+
+        g1_keys = [_key(10, 20, 'hmac_sha_1_96', INITIAL_SECRET)]
+        g2_keys = [_key(20, 10, 'hmac_sha_1_96', INITIAL_SECRET)]
+        g1 = GoBGPContainer(
+            name='ao-dynamic-g1', asn=65000, router_id='192.168.0.1',
+            ctn_image_name=parser_option.gobgp_image,
+            log_level=parser_option.gobgp_log_level,
+            bgp_config={
+                'keychains': [_keychain('g1-dynamic-chain', g1_keys)],
+                'peer-groups': [{
+                    'config': {
+                        'peer-group-name': 'ao-dynamic-group',
+                        'peer-as': 65001,
+                    },
+                    'tcp-ao': {'config': _tcp_ao_config(
+                        'g1-dynamic-chain', 10)},
+                    'timers': {'config': TCP_AO_TIMERS},
+                }],
+                'dynamic-neighbors': [{
+                    'config': {
+                        'prefix': DYNAMIC_NEIGHBOR_PREFIX,
+                        'peer-group': 'ao-dynamic-group',
+                    },
+                }],
+            })
+        g2 = GoBGPContainer(
+            name='ao-dynamic-g2', asn=65001, router_id='192.168.0.2',
+            ctn_image_name=parser_option.gobgp_image,
+            log_level=parser_option.gobgp_log_level,
+            bgp_config={'keychains': [
+                _keychain('g2-dynamic-chain', g2_keys),
+            ]})
+
+        time.sleep(max(g1.run(), g2.run()))
+        g2.add_peer(g1, tcp_ao=_tcp_ao_config('g2-dynamic-chain', 20),
+                    timers=TCP_AO_TIMERS)
+
+        cls.g1 = g1
+        cls.g2 = g2
+        cls.g1_keys = g1_keys
+        cls.g2_keys = g2_keys
+        cls.g2_addr = g2.ip_addrs[0][1].split('/')[0]
+
+    def _wait_established(self):
+        self.g2.wait_for(expected_state=BGP_FSM_ESTABLISHED, peer=self.g1)
+        _wait_dynamic_established(self.g1, self.g2_addr)
+
+    def test_01_peering_and_key_rotation(self):
+        self._wait_established()
+        _assert_selected_key(self, self.g1, self.g2_addr, 10, [10])
+        _assert_selected_key(self, self.g2, self.g1, 20, [20])
+
+        # Add the next MKT to the dynamic prefix and the active peer before
+        # either side starts requesting it.
+        self.g1_keys.append(
+            _key(11, 21, 'aes_128_cmac_96', ROTATION_SECRET))
+        self.g2_keys.append(
+            _key(21, 11, 'aes_128_cmac_96', ROTATION_SECRET))
+        _reload_keychain(self.g1, 'g1-dynamic-chain', self.g1_keys)
+        _reload_keychain(self.g2, 'g2-dynamic-chain', self.g2_keys)
+
+        # Rotate the preferred IDs. Updating the peer group changes existing
+        # dynamic sockets in place; it does not replace the listener prefix.
+        self.g1.bgp_config['peer-groups'][0][
+            'tcp-ao']['config']['preferred-send-id'] = 11
+        self.g1.create_config()
+        self.g1.reload_config()
+        _reload_tcp_ao_config(
+            self.g2, self.g1, 'g2-dynamic-chain', self.g2_keys, 21)
+        _assert_selected_key(self, self.g1, self.g2_addr, 11, [10, 11])
+        _assert_selected_key(self, self.g2, self.g1, 21, [20, 21])
+
+        # Remove the previous generation and reconnect. The new connection
+        # proves that the dynamic listener prefix was updated as well as the
+        # already established socket.
+        self.g1_keys = self.g1_keys[-1:]
+        self.g2_keys = self.g2_keys[-1:]
+        _reload_keychain(self.g1, 'g1-dynamic-chain', self.g1_keys)
+        _reload_keychain(self.g2, 'g2-dynamic-chain', self.g2_keys)
+        _assert_selected_key(self, self.g1, self.g2_addr, 11, [11])
+        _assert_selected_key(self, self.g2, self.g1, 21, [21])
+
+        self.g2.stop_gobgp()
+        self.g2.start_gobgp()
+        self._wait_established()
+        _assert_selected_key(self, self.g1, self.g2_addr, 11, [11])
+        _assert_selected_key(self, self.g2, self.g1, 21, [21])
 
 
 class GoBGPTCPAOVRFTest(unittest.TestCase):

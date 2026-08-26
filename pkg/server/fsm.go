@@ -975,7 +975,11 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 						}
 						defer tcpAoKeys.clear()
 						tcpAoKeychainRevision = tcpAoKeys.keychainRevision
-						if err := addTcpAoKeys(c, addr, bindInterface, tcpAoKeys, true); err != nil {
+						peerScope, interfaceName, err := tcpAoPeerScope(addr, bindInterface)
+						if err != nil {
+							return err
+						}
+						if err := addTcpAoKeys(c, peerScope, interfaceName, tcpAoKeys, true); err != nil {
 							return fmt.Errorf("failed to configure TCP-AO for peer %s: %w", addr, err)
 						}
 					}

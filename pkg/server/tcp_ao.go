@@ -325,6 +325,31 @@ func tcpAoConnectionKeysMatch(conn net.Conn, socketKeys *tcpAoSocketKeys) (bool,
 	return true, nil
 }
 
+func configureAcceptedTcpAoConnection(conn net.Conn, keyBinding *tcpAoKeyBinding) (net.Conn, error) {
+	tcpAoKeys, err := keyBinding.socketKeys()
+	if err != nil {
+		return conn, fmt.Errorf("load TCP-AO keychain: %w", err)
+	}
+	defer tcpAoKeys.clear()
+	if tcpAoKeys != nil {
+		matches, err := tcpAoConnectionKeysMatch(conn, tcpAoKeys)
+		if err != nil {
+			return conn, fmt.Errorf("read TCP-AO keys from the connection: %w", err)
+		}
+		if !matches {
+			return conn, fmt.Errorf("accepted TCP-AO connection has stale keys")
+		}
+		if err := setTcpAoConnectionPreferredKey(conn, tcpAoKeys); err != nil {
+			return conn, fmt.Errorf("select preferred TCP-AO key: %w", err)
+		}
+	}
+	revision := uint64(0)
+	if tcpAoKeys != nil {
+		revision = tcpAoKeys.keychainRevision
+	}
+	return &tcpAoConnection{Conn: conn, keyBinding: keyBinding, keychainRevision: revision}, nil
+}
+
 func (k *tcpAoSocketKeys) netutilsConfig(selectPreferred bool) (netutils.TCPAOConfig, error) {
 	if k == nil {
 		return netutils.TCPAOConfig{}, fmt.Errorf("missing TCP-AO socket keys")
@@ -340,38 +365,27 @@ func (k *tcpAoSocketKeys) netutilsConfig(selectPreferred bool) (netutils.TCPAOCo
 	return result, nil
 }
 
-func addTcpAoKeys(raw syscall.RawConn, peerAddr netip.Addr, interfaceName string, socketKeys *tcpAoSocketKeys, selectPreferred bool) error {
-	peerPrefix, interfaceName, err := tcpAoPeerScope(peerAddr, interfaceName)
-	if err != nil {
-		return err
-	}
+func addTcpAoKeys(raw syscall.RawConn, peerScope netip.Prefix, interfaceName string, socketKeys *tcpAoSocketKeys, selectPreferred bool) error {
 	config, err := socketKeys.netutilsConfig(selectPreferred)
 	if err != nil {
 		return err
 	}
-	return netutils.AddTCPAOKeysSockopt(raw, peerPrefix, interfaceName, config)
+	return netutils.AddTCPAOKeysSockopt(raw, peerScope, interfaceName, config)
 }
 
-func deleteTcpAoKeys(raw syscall.RawConn, peerAddr netip.Addr, interfaceName string, socketKeys *tcpAoSocketKeys) error {
-	peerPrefix, interfaceName, err := tcpAoPeerScope(peerAddr, interfaceName)
-	if err != nil {
-		return err
-	}
+func deleteTcpAoKeys(raw syscall.RawConn, peerScope netip.Prefix, interfaceName string, socketKeys *tcpAoSocketKeys) error {
 	config, err := socketKeys.netutilsConfig(false)
 	if err != nil {
 		return err
 	}
-	return netutils.DeleteTCPAOKeysSockopt(raw, peerPrefix, interfaceName, config)
+	return netutils.DeleteTCPAOKeysSockopt(raw, peerScope, interfaceName, config)
 }
 
-func addTcpAoKeysToListeners(listeners []*net.TCPListener, peerAddr netip.Addr, interfaceName string, socketKeys *tcpAoSocketKeys) error {
-	if _, _, err := tcpAoPeerScope(peerAddr, interfaceName); err != nil {
-		return err
-	}
+func addTcpAoKeysToListeners(listeners []*net.TCPListener, peerScope netip.Prefix, interfaceName string, socketKeys *tcpAoSocketKeys) error {
 	configured := make([]*net.TCPListener, 0, len(listeners))
 	rollback := func(cause error) error {
 		errs := []error{cause}
-		for _, err := range deleteTcpAoKeysFromListeners(configured, peerAddr, interfaceName, socketKeys) {
+		for _, err := range deleteTcpAoKeysFromListeners(configured, peerScope, interfaceName, socketKeys) {
 			errs = append(errs, fmt.Errorf("failed to roll back TCP-AO listener configuration: %w", err))
 		}
 		return errors.Join(errs...)
@@ -384,19 +398,19 @@ func addTcpAoKeysToListeners(listeners []*net.TCPListener, peerAddr netip.Addr, 
 		// AddTCPAOKeysSockopt installs keys one at a time and can fail
 		// after partially configuring the listener.
 		configured = append(configured, listener)
-		if err := addTcpAoKeys(raw, peerAddr, interfaceName, socketKeys, false); err != nil {
+		if err := addTcpAoKeys(raw, peerScope, interfaceName, socketKeys, false); err != nil {
 			return rollback(err)
 		}
 	}
 	return nil
 }
 
-func deleteTcpAoKeysFromListeners(listeners []*net.TCPListener, peerAddr netip.Addr, interfaceName string, socketKeys *tcpAoSocketKeys) []error {
+func deleteTcpAoKeysFromListeners(listeners []*net.TCPListener, peerScope netip.Prefix, interfaceName string, socketKeys *tcpAoSocketKeys) []error {
 	var result []error
 	for _, listener := range listeners {
 		raw, err := listener.SyscallConn()
 		if err == nil {
-			err = deleteTcpAoKeys(raw, peerAddr, interfaceName, socketKeys)
+			err = deleteTcpAoKeys(raw, peerScope, interfaceName, socketKeys)
 		}
 		if err != nil {
 			result = append(result, err)

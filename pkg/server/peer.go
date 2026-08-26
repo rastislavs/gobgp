@@ -102,13 +102,14 @@ func newDynamicPeer(g *oc.Global, neighborAddress string, pg *oc.PeerGroup, loc 
 type pathIDSet map[uint32]struct{}
 
 type peer struct {
-	tableId           string
-	fsm               *fsm
-	adjRibIn          *table.AdjRib
-	policy            *table.RoutingPolicy
-	localRib          *table.TableManager
-	peerInfo          atomic.Pointer[table.PeerInfo]
-	prefixLimitWarned map[bgp.Family]bool // protected by fsm.lock
+	tableId               string
+	fsm                   *fsm
+	dynamicNeighborPrefix netip.Prefix
+	adjRibIn              *table.AdjRib
+	policy                *table.RoutingPolicy
+	localRib              *table.TableManager
+	peerInfo              atomic.Pointer[table.PeerInfo]
+	prefixLimitWarned     map[bgp.Family]bool // protected by fsm.lock
 	// map[table.PathDestLocalKey]pathIDSet, with inner pathIDSets protected
 	// by the matching server propagation bucket for the route prefix.
 	// All methods that read or mutate a pathIDSet value (updateRoutes,

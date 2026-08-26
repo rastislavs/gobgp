@@ -5,13 +5,14 @@ agility. It is defined by [RFC 5925](https://www.rfc-editor.org/rfc/rfc5925.html
 with its initial algorithms defined by
 [RFC 5926](https://www.rfc-editor.org/rfc/rfc5926.html).
 
-GoBGP supports TCP-AO for static BGP peers on Linux. The kernel performs TCP-AO
-authentication; GoBGP manages keychains, attaches them to peers, and programs
-the corresponding socket options.
+GoBGP supports TCP-AO for static and dynamic BGP peers on Linux. The kernel
+performs TCP-AO authentication; GoBGP manages keychains, attaches them to
+peers, and programs the corresponding socket options.
 
 ## Supported Features
 
 - active and passive static IPv4, IPv6, and IPv6 link-local peers;
+- passive dynamic IPv4 and IPv6 peers;
 - IPv6 unnumbered peers;
 - peers attached to GoBGP logical VRFs;
 - keys scoped to Linux VRF devices;
@@ -133,6 +134,35 @@ TCP-AO can be configured on a peer group and inherited by its static members:
 
 An explicit neighbor attachment takes precedence over an inherited peer-group
 attachment.
+
+### Dynamic Neighbors
+
+A dynamic neighbor inherits TCP-AO from its peer group. GoBGP installs the
+keychain on the listening socket using the dynamic neighbor prefix, before a
+matching connection can be accepted:
+
+```toml
+[[peer-groups]]
+  [peer-groups.config]
+    peer-group-name = "ao-dynamic-peers"
+    peer-as = 65002
+
+  [peer-groups.tcp-ao.config]
+    keychain = "fabric"
+    preferred-send-id = 0
+
+[[dynamic-neighbors]]
+  [dynamic-neighbors.config]
+    prefix = "192.0.2.0/24"
+    peer-group = "ao-dynamic-peers"
+```
+
+Preferred-send-ID changes and keychain rotations are applied to existing
+dynamic sessions and the prefix-scoped listener keys. The referenced keychain
+or bind interface cannot be replaced while the peer group has a configured
+dynamic range or a live dynamic session; remove the range first. TCP-AO
+dynamic ranges cannot overlap other dynamic ranges because Linux does not
+provide longest-prefix selection between matching MKTs.
 
 ### Logical VRFs
 
@@ -339,7 +369,8 @@ deleting it.
 
 Changing a peer to a different keychain with `UpdatePeer` is rejected; delete
 and add the peer to make that change. A peer-group attachment also cannot be
-changed while the group has static members.
+changed while the group has static members or dynamic neighbors. A dynamic
+peer group's preferred send ID can be changed in place.
 
 File reloads use the same API operations and therefore follow the same rules.
 
@@ -360,7 +391,6 @@ TCP-option authentication policy.
 ## Current Limitations
 
 - Linux `amd64` and `arm64` only;
-- static peers only; dynamic neighbors are not supported;
 - no key lifetimes, scheduled rollover, or tolerance windows;
 - no automatic retry of a failed update on an existing socket; and
 - no master-key file or external secret-provider support.

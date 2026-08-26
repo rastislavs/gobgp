@@ -529,4 +529,69 @@ func TestTcpAoPeerOperations(t *testing.T) {
 	require.NotNil(t, keyBinding)
 	assert.Equal(t, "group-chain", keyBinding.keychain.name)
 	assert.Equal(t, "group-chain", string(peer.fsm.pConf.ReadOnly().TcpAo.Config.Keychain))
+
+	// Dynamic ranges inherit TCP-AO from their peer group. The range holds the
+	// keychain reference even before a peer connects.
+	require.NoError(t, s.AddDynamicNeighbor(context.Background(), &api.AddDynamicNeighborRequest{DynamicNeighbor: &api.DynamicNeighbor{
+		Prefix:    "198.51.100.0/24",
+		PeerGroup: "ao-group",
+	}}))
+	assert.Contains(t, s.peerGroupMap["ao-group"].dynamicNeighbors, "198.51.100.0/24")
+
+	// Key additions are propagated without changing the dynamic range or its
+	// peer-group attachment.
+	_, err = s.UpdateTcpAoKeychain(context.Background(), &api.UpdateTcpAoKeychainRequest{
+		Name:    "group-chain",
+		AddKeys: []*api.TcpAoKey{{SendId: 5, ReceiveId: 6, Algorithm: api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA1_96, MasterKey: []byte("new")}},
+	})
+	require.NoError(t, err)
+
+	// Overlapping dynamic ranges are rejected when either range uses TCP-AO,
+	// because the kernel does not provide longest-prefix MKT selection.
+	require.NoError(t, s.AddPeerGroup(context.Background(), &api.AddPeerGroupRequest{PeerGroup: &api.PeerGroup{
+		Conf: &api.PeerGroupConf{PeerGroupName: "plain-group", PeerAsn: 65001},
+	}}))
+	err = s.AddDynamicNeighbor(context.Background(), &api.AddDynamicNeighborRequest{DynamicNeighbor: &api.DynamicNeighbor{
+		Prefix:    "198.51.100.128/25",
+		PeerGroup: "plain-group",
+	}})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The peer-group form has the same TCP-AO/TCP-MD5 exclusion as a static
+	// neighbor once a dynamic range tries to use it.
+	require.NoError(t, s.AddPeerGroup(context.Background(), &api.AddPeerGroupRequest{PeerGroup: &api.PeerGroup{
+		Conf: &api.PeerGroupConf{
+			PeerGroupName: "mixed-auth-group",
+			PeerAsn:       65001,
+			AuthPassword:  "md5",
+		},
+		TcpAo: &api.TcpAoPeerConfig{Keychain: "group-chain", PreferredSendId: 1},
+	}}))
+	err = s.AddDynamicNeighbor(context.Background(), &api.AddDynamicNeighborRequest{DynamicNeighbor: &api.DynamicNeighbor{
+		Prefix:    "203.0.113.0/24",
+		PeerGroup: "mixed-auth-group",
+	}})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	// The preferred send ID can be rotated while the range remains installed.
+	_, err = s.UpdatePeerGroup(context.Background(), &api.UpdatePeerGroupRequest{PeerGroup: &api.PeerGroup{
+		Conf:  &api.PeerGroupConf{PeerGroupName: "ao-group", PeerAsn: 65001},
+		TcpAo: &api.TcpAoPeerConfig{Keychain: "group-chain", PreferredSendId: 5},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, uint8(5), s.peerGroupMap["ao-group"].Conf.TcpAo.Config.PreferredSendId)
+
+	// Replacing the attachment while a dynamic range is present is rejected
+	// rather than leaving stale listener keys behind.
+	_, err = s.UpdatePeerGroup(context.Background(), &api.UpdatePeerGroupRequest{PeerGroup: &api.PeerGroup{
+		Conf:  &api.PeerGroupConf{PeerGroupName: "ao-group", PeerAsn: 65001},
+		TcpAo: &api.TcpAoPeerConfig{Keychain: "replacement", PreferredSendId: 3},
+	}})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	require.NoError(t, s.DeleteDynamicNeighbor(context.Background(), &api.DeleteDynamicNeighborRequest{
+		Prefix:    "198.51.100.0/24",
+		PeerGroup: "ao-group",
+	}))
+	assert.NotContains(t, s.peerGroupMap["ao-group"].dynamicNeighbors, "198.51.100.0/24")
 }

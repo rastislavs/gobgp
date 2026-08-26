@@ -342,41 +342,17 @@ func (s *BgpServer) passConnToPeer(conn net.Conn) {
 			return
 		}
 		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
-		tcpAoKeys, err := keyBinding.socketKeys()
+		configuredConn, err := configureAcceptedTcpAoConnection(conn, keyBinding)
 		if err != nil {
-			peer.fsm.logger.Warn("could not load TCP-AO keychain", slog.String("Error", err.Error()))
+			peer.fsm.logger.Warn("could not configure accepted connection", slog.String("Error", err.Error()))
 			conn.Close()
 			return
 		}
-		defer tcpAoKeys.clear()
-		if tcpAoKeys != nil {
-			matches, err := tcpAoConnectionKeysMatch(conn, tcpAoKeys)
-			if err != nil {
-				peer.fsm.logger.Warn("could not read TCP-AO keys from the connection", slog.String("Error", err.Error()))
-				conn.Close()
-				return
-			}
-			if !matches {
-				peer.fsm.logger.Warn("accepted TCP-AO connection has stale keys")
-				conn.Close()
-				return
-			}
-			err = setTcpAoConnectionPreferredKey(conn, tcpAoKeys)
-			if err != nil {
-				peer.fsm.logger.Warn("could not configure TCP-AO for the connection", slog.String("Error", err.Error()))
-				conn.Close()
-				return
-			}
-		}
-		tcpAoKeychainRevision := uint64(0)
-		if tcpAoKeys != nil {
-			tcpAoKeychainRevision = tcpAoKeys.keychainRevision
-		}
-		conn = &tcpAoConnection{Conn: conn, keyBinding: keyBinding, keychainRevision: tcpAoKeychainRevision}
+		conn = configuredConn
 
 		peer.fsm.logger.Debug("Accepted a new passive connection")
 		peer.PassConn(conn)
-	} else if pg := s.matchLongestDynamicNeighborPrefix(addr.WithZone("").String()); pg != nil {
+	} else if pg, dynamicNeighborPrefix := s.matchLongestDynamicNeighborPrefix(addr.WithZone("").String()); pg != nil {
 		s.logger.Debug("Accepted a new dynamic neighbor",
 			slog.String("Topic", "Peer"),
 			slog.String("Key", addr.String()),
@@ -394,10 +370,24 @@ func (s *BgpServer) passConnToPeer(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		peer.dynamicNeighborPrefix = dynamicNeighborPrefix
 		conf := peer.fsm.pConf.ReadOnly()
 		policy := conf.ApplyPolicy
 		if err := s.policy.SetPeerPolicy(peer.ID(), policy); err != nil {
 			peer.fsm.logger.Error("Failed to set peer policy for dynamic peer", slog.Any("Error", err))
+			conn.Close()
+			return
+		}
+		keyBinding, err := s.getTcpAoKeyBinding(&conf.TcpAo.Config)
+		if err != nil {
+			peer.fsm.logger.Warn("could not load TCP-AO keychain", slog.String("Error", err.Error()))
+			conn.Close()
+			return
+		}
+		peer.fsm.tcpAoKeyBinding.Store(keyBinding)
+		conn, err = configureAcceptedTcpAoConnection(conn, keyBinding)
+		if err != nil {
+			peer.fsm.logger.Warn("could not configure accepted connection", slog.String("Error", err.Error()))
 			conn.Close()
 			return
 		}
@@ -474,10 +464,11 @@ func (s *BgpServer) Serve() {
 	}
 }
 
-func (s *BgpServer) matchLongestDynamicNeighborPrefix(a string) *peerGroup {
+func (s *BgpServer) matchLongestDynamicNeighborPrefix(a string) (*peerGroup, netip.Prefix) {
 	ipAddr := net.ParseIP(a)
 	longestMask := net.CIDRMask(0, 32).String()
 	var longestPG *peerGroup
+	var longestPrefix netip.Prefix
 	for _, pg := range s.peerGroupMap {
 		for _, d := range pg.dynamicNeighbors {
 			_, netAddr, err := net.ParseCIDR(d.Config.Prefix.String())
@@ -489,11 +480,12 @@ func (s *BgpServer) matchLongestDynamicNeighborPrefix(a string) *peerGroup {
 					netAddr.Mask.String() == longestMask && longestMask == net.CIDRMask(0, 32).String() {
 					longestMask = netAddr.Mask.String()
 					longestPG = pg
+					longestPrefix = d.Config.Prefix
 				}
 			}
 		}
 	}
-	return longestPG
+	return longestPG, longestPrefix
 }
 
 func sendfsmOutgoingMsg(peer *peer, paths []*table.Path) {
@@ -3598,7 +3590,11 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		listeners = s.listListeners(addr)
 	}
 	if tcpAoKeys != nil {
-		if err := addTcpAoKeysToListeners(listeners, ipAddr, s.tcpAoBindInterface(c.Transport.Config), tcpAoKeys); err != nil {
+		peerScope, interfaceName, err := tcpAoPeerScope(ipAddr, s.tcpAoBindInterface(c.Transport.Config))
+		if err != nil {
+			return err
+		}
+		if err := addTcpAoKeysToListeners(listeners, peerScope, interfaceName, tcpAoKeys); err != nil {
 			return fmt.Errorf("failed to configure TCP-AO listener for peer %s: %w", addr, err)
 		}
 	}
@@ -3750,8 +3746,44 @@ func (s *BgpServer) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNei
 		if !ok {
 			return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
 		}
-		if pg.Conf.TcpAo.Config.Keychain != "" {
-			return status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are not supported")
+		_, alreadyExists := pg.dynamicNeighbors[p.String()]
+		keyBinding, err := s.getTcpAoKeyBinding(&pg.Conf.TcpAo.Config)
+		if err != nil {
+			return err
+		}
+		if alreadyExists && keyBinding != nil {
+			return nil
+		}
+		for _, existingGroup := range s.peerGroupMap {
+			if len(existingGroup.dynamicNeighbors) == 0 {
+				continue
+			}
+			existingBinding, err := s.getTcpAoKeyBinding(&existingGroup.Conf.TcpAo.Config)
+			if err != nil {
+				return err
+			}
+			if keyBinding == nil && existingBinding == nil {
+				continue
+			}
+			for _, dynamicNeighbor := range existingGroup.dynamicNeighbors {
+				if p.Overlaps(dynamicNeighbor.Config.Prefix) {
+					return status.Errorf(codes.InvalidArgument, "TCP-AO dynamic neighbor prefix %s overlaps configured dynamic neighbor prefix %s", p, dynamicNeighbor.Config.Prefix)
+				}
+			}
+		}
+		if keyBinding != nil && pg.Conf.Config.AuthPassword != "" {
+			return status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+		}
+		tcpAoKeys, err := keyBinding.socketKeys()
+		if err != nil {
+			return err
+		}
+		defer tcpAoKeys.clear()
+		if tcpAoKeys != nil {
+			interfaceName := s.tcpAoBindInterface(pg.Conf.Transport.Config)
+			if err := addTcpAoKeysToListeners(s.listListeners(p.Addr().String()), p, interfaceName, tcpAoKeys); err != nil {
+				return fmt.Errorf("failed to configure TCP-AO listener for dynamic neighbor %s: %w", p, err)
+			}
 		}
 		pg.AddDynamicNeighbor(c)
 
@@ -3821,7 +3853,11 @@ func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNoti
 	defer tcpAoKeys.clear()
 	listeners := s.listListeners(addr)
 	if tcpAoKeys != nil {
-		for _, err := range deleteTcpAoKeysFromListeners(listeners, ipAddr, s.tcpAoBindInterface(configured.Transport.Config), tcpAoKeys) {
+		peerScope, interfaceName, err := tcpAoPeerScope(ipAddr, s.tcpAoBindInterface(configured.Transport.Config))
+		if err != nil {
+			return err
+		}
+		for _, err := range deleteTcpAoKeysFromListeners(listeners, peerScope, interfaceName, tcpAoKeys) {
 			n.fsm.logger.Warn("failed to unset TCP-AO", slog.String("Err", err.Error()))
 		}
 	}
@@ -3889,9 +3925,30 @@ func (s *BgpServer) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDyna
 		if !ok {
 			return fmt.Errorf("no such peer-group: %s", r.PeerGroup)
 		}
-		pg.DeleteDynamicNeighbor(r.Prefix)
-
 		pConf := pg.Conf
+		keyBinding, err := s.getTcpAoKeyBinding(&pConf.TcpAo.Config)
+		if err != nil {
+			return err
+		}
+		tcpAoKeys, err := keyBinding.socketKeys()
+		if err != nil {
+			return err
+		}
+		defer tcpAoKeys.clear()
+		if tcpAoKeys != nil {
+			prefix, err := netip.ParsePrefix(r.Prefix)
+			if err != nil {
+				return fmt.Errorf("invalid prefix: %v", err)
+			}
+			interfaceName := s.tcpAoBindInterface(pConf.Transport.Config)
+			for _, err := range deleteTcpAoKeysFromListeners(s.listListeners(prefix.Addr().String()), prefix, interfaceName, tcpAoKeys) {
+				s.logger.Warn("failed to clear TCP-AO for dynamic neighbor",
+					slog.String("Topic", "Peer"),
+					slog.String("Key", r.Prefix),
+					slog.String("Err", err.Error()))
+			}
+		}
+		pg.DeleteDynamicNeighbor(r.Prefix)
 		if pConf.Config.AuthPassword != "" {
 			prefix := r.Prefix
 			addr, _, perr := net.ParseCIDR(prefix)
@@ -3919,13 +3976,55 @@ func (s *BgpServer) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDyna
 func (s *BgpServer) updatePeerGroup(pg *oc.PeerGroup) (needsSoftResetIn bool, err error) {
 	name := pg.Config.PeerGroupName
 
-	_, ok := s.peerGroupMap[name]
+	group, ok := s.peerGroupMap[name]
 	if !ok {
 		return false, fmt.Errorf("peer-group %s doesn't exist", name)
 	}
-	s.peerGroupMap[name].Conf = pg
+	dynamicPeers := make([]*peer, 0)
+	for _, peer := range s.neighborMap {
+		conf := peer.fsm.pConf.ReadOnly()
+		if peer.isDynamicNeighbor() && conf.Config.PeerGroup == name {
+			dynamicPeers = append(dynamicPeers, peer)
+		}
+	}
+	dynamicPeerExists := len(group.dynamicNeighbors) != 0 || len(dynamicPeers) != 0
+	if dynamicPeerExists && pg.TcpAo.Config.Keychain != "" && pg.Config.AuthPassword != "" {
+		return false, status.Error(codes.InvalidArgument, "TCP-AO and TCP-MD5 authentication are mutually exclusive")
+	}
+	tcpAoConfigured := group.Conf.TcpAo.Config.Keychain != "" || pg.TcpAo.Config.Keychain != ""
+	keychainChanged := group.Conf.TcpAo.Config.Keychain != pg.TcpAo.Config.Keychain
+	bindInterfaceChanged := s.tcpAoBindInterface(group.Conf.Transport.Config) != s.tcpAoBindInterface(pg.Transport.Config)
+	attachmentChanged := tcpAoConfigured && (keychainChanged || bindInterfaceChanged)
+	if attachmentChanged && dynamicPeerExists {
+		return false, status.Errorf(codes.FailedPrecondition, "cannot change TCP-AO keychain or bind interface for peer-group %q while it has dynamic neighbors", name)
+	}
+	if tcpAoConfigured && dynamicPeerExists && !group.Conf.TcpAo.Config.Equal(&pg.TcpAo.Config) {
+		keyBinding, err := s.getTcpAoKeyBinding(&pg.TcpAo.Config)
+		if err != nil {
+			return false, err
+		}
+		tcpAoKeys, err := keyBinding.socketKeys()
+		if err != nil {
+			return false, err
+		}
+		defer tcpAoKeys.clear()
+		for _, peer := range dynamicPeers {
+			peer.fsm.lock.Lock()
+			if peer.fsm.conn != nil && tcpAoKeys != nil {
+				if err := setTcpAoConnectionRNext(peer.fsm.conn, tcpAoKeys); err != nil {
+					peer.fsm.logger.Warn("failed changing the TCP-AO key", slog.String("Error", err.Error()))
+				}
+			}
+			peer.fsm.tcpAoKeyBinding.Store(keyBinding)
+			conf := peer.fsm.pConf.ReadCopy()
+			conf.TcpAo = pg.TcpAo
+			peer.fsm.pConf.Update(&conf)
+			peer.fsm.lock.Unlock()
+		}
+	}
+	group.Conf = pg
 
-	for _, n := range s.peerGroupMap[name].members {
+	for _, n := range group.members {
 		u, err := s.updateNeighbor(&n)
 		if err != nil {
 			return needsSoftResetIn, err
@@ -5745,6 +5844,38 @@ func (s *BgpServer) updateTcpAoKeychainSockets(name string, added, deleted []net
 			slog.String("Target", target),
 			slog.String("Error", err.Error()))
 	}
+	for _, group := range s.peerGroupMap {
+		if string(group.Conf.TcpAo.Config.Keychain) != name {
+			continue
+		}
+		interfaceName := s.tcpAoBindInterface(group.Conf.Transport.Config)
+		for _, dynamicNeighbor := range group.dynamicNeighbors {
+			prefix := dynamicNeighbor.Config.Prefix
+			for _, listener := range s.listListeners(prefix.Addr().String()) {
+				raw, err := listener.SyscallConn()
+				if err != nil {
+					s.logger.Warn("failed to update TCP-AO keys for dynamic neighbor",
+						slog.String("Prefix", prefix.String()),
+						slog.String("Error", err.Error()))
+					continue
+				}
+				if len(deleted) != 0 {
+					if err := deleteTcpAoKeys(raw, prefix, interfaceName, deletedKeys); err != nil {
+						s.logger.Warn("failed to delete TCP-AO keys from dynamic neighbor listener",
+							slog.String("Prefix", prefix.String()),
+							slog.String("Error", err.Error()))
+					}
+				}
+				if len(added) != 0 {
+					if err := addTcpAoKeys(raw, prefix, interfaceName, addedKeys, false); err != nil {
+						s.logger.Warn("failed to add TCP-AO keys to dynamic neighbor listener",
+							slog.String("Prefix", prefix.String()),
+							slog.String("Error", err.Error()))
+					}
+				}
+			}
+		}
+	}
 	for _, peer := range s.neighborMap {
 		keyBinding := peer.fsm.tcpAoKeyBinding.Load()
 		if keyBinding == nil || keyBinding.keychain.name != name {
@@ -5761,26 +5892,36 @@ func (s *BgpServer) updateTcpAoKeychainSockets(name string, added, deleted []net
 			logError(peer, "peer", err)
 			continue
 		}
-		interfaceName := s.tcpAoBindInterface(conf.Transport.Config)
-		for _, listener := range s.listListeners(addr) {
-			raw, err := listener.SyscallConn()
-			if err != nil {
+		peerScope, interfaceName, err := tcpAoPeerScope(peerAddr, s.tcpAoBindInterface(conf.Transport.Config))
+		if err != nil {
+			logError(peer, "peer", err)
+			continue
+		}
+		dynamicPeer := peer.isDynamicNeighbor()
+		if dynamicPeer {
+			peerScope = peer.dynamicNeighborPrefix
+		}
+		if !dynamicPeer {
+			for _, listener := range s.listListeners(addr) {
+				raw, err := listener.SyscallConn()
+				if err != nil {
+					if len(deleted) != 0 {
+						logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
+					}
+					if len(added) != 0 {
+						logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
+					}
+					continue
+				}
 				if len(deleted) != 0 {
-					logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
+					if err := deleteTcpAoKeys(raw, peerScope, interfaceName, deletedKeys); err != nil {
+						logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
+					}
 				}
 				if len(added) != 0 {
-					logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
-				}
-				continue
-			}
-			if len(deleted) != 0 {
-				if err := deleteTcpAoKeys(raw, peerAddr, interfaceName, deletedKeys); err != nil {
-					logError(peer, "listener", fmt.Errorf("delete TCP-AO keys: %w", err))
-				}
-			}
-			if len(added) != 0 {
-				if err := addTcpAoKeys(raw, peerAddr, interfaceName, addedKeys, false); err != nil {
-					logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
+					if err := addTcpAoKeys(raw, peerScope, interfaceName, addedKeys, false); err != nil {
+						logError(peer, "listener", fmt.Errorf("add TCP-AO keys: %w", err))
+					}
 				}
 			}
 		}
@@ -5798,12 +5939,12 @@ func (s *BgpServer) updateTcpAoKeychainSockets(name string, added, deleted []net
 				continue
 			}
 			if len(deleted) != 0 {
-				if err := deleteTcpAoKeys(raw, peerAddr, interfaceName, deletedKeys); err != nil {
+				if err := deleteTcpAoKeys(raw, peerScope, interfaceName, deletedKeys); err != nil {
 					logError(peer, "connection", fmt.Errorf("delete TCP-AO keys: %w", err))
 				}
 			}
 			if len(added) != 0 {
-				if err := addTcpAoKeys(raw, peerAddr, interfaceName, addedKeys, false); err != nil {
+				if err := addTcpAoKeys(raw, peerScope, interfaceName, addedKeys, false); err != nil {
 					logError(peer, "connection", fmt.Errorf("add TCP-AO keys: %w", err))
 				}
 			}
